@@ -51,6 +51,8 @@ jobs:
         sudo -E apt-get -qq autoremove --purge
         sudo -E apt-get -qq clean
         sudo timedatectl set-timezone "$TZ"
+        # 新增：修复/tmp目录权限（解决无法创建临时文件问题）
+        sudo chmod 1777 /tmp
         sudo mkdir -p /workdir
         sudo chown $USER:$GROUPS /workdir
 
@@ -103,11 +105,20 @@ jobs:
       run: |
         cd openwrt
         echo -e "$(nproc) thread compile"
+        # 修复：添加编译状态判断，失败时不输出success
+        COMPILE_SUCCESS=0
         make -j$(nproc) || make -j1 || make -j1 V=s
-        echo "status=success" >> $GITHUB_OUTPUT
-        grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME
-        [ -s DEVICE_NAME ] && echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> $GITHUB_ENV
-        echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
+        if [ $? -eq 0 ]; then
+          COMPILE_SUCCESS=1
+          echo "status=success" >> $GITHUB_OUTPUT
+          # 提取设备型号
+          grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME
+          [ -s DEVICE_NAME ] && echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> $GITHUB_ENV
+          echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
+        else
+          echo "status=failure" >> $GITHUB_OUTPUT
+          exit 1
+        fi
 
     - name: Check space usage
       if: (!cancelled())
@@ -123,7 +134,7 @@ jobs:
     # 整理编译好的固件
     - name: Organize files
       id: organize
-      if: env.UPLOAD_FIRMWARE == 'true' && !cancelled()
+      if: env.UPLOAD_FIRMWARE == 'true' && !cancelled() && steps.compile.outputs.status == 'success'
       run: |
         cd openwrt/bin/targets/*/*
         rm -rf packages
@@ -161,7 +172,7 @@ jobs:
 
     - name: Generate release tag
       id: tag
-      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
+      if: env.UPLOAD_RELEASE == 'true' && !cancelled() && steps.compile.outputs.status == 'success'
       run: |
         echo "release_tag=$(date +"%Y.%m.%d-%H%M-immortalwrt24.10-6.6-cmcc_rax3000m-237")" >> $GITHUB_OUTPUT
         touch release.txt
