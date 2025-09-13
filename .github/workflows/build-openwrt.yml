@@ -52,16 +52,18 @@ jobs:
         sudo apt-get clean
         # 清理临时文件和apt缓存
         sudo rm -rf /var/cache/apt/archives/* /var/tmp/* /tmp/*
-        # 修复/tmp权限（解决临时文件创建失败）
+        # 修复/tmp权限+新增临时目录重定向（解决/tmp空间不足）
         sudo chmod 1777 /tmp
-        # 安装编译依赖
+        sudo mkdir -p /workdir/tmp && sudo chmod 1777 /workdir/tmp
+        export TMPDIR=/workdir/tmp && echo "TMPDIR=/workdir/tmp" >> $GITHUB_ENV
+        # 安装编译依赖（保留原外部链接，补充--no-install-recommends减少冗余）
         sudo -E apt-get -qq update
-        sudo -E apt-get -qq install $(curl -fsSL git.io/depends-ubuntu-2004)
+        sudo -E apt-get -qq install --no-install-recommends $(curl -fsSL git.io/depends-ubuntu-2004)
         # 配置时区
         sudo timedatectl set-timezone "$TZ"
         # 检查清理后空间
         echo "=== Disk space after environment init ==="
-        df -hT / /tmp
+        df -hT / /tmp /workdir/tmp
         # 创建工作目录并授权
         sudo mkdir -p /workdir
         sudo chown $USER:$GROUPS /workdir
@@ -106,10 +108,13 @@ jobs:
       run: |
         cd openwrt
         make defconfig
-        make download -j8  # 多线程下载依赖包
-        # 删除空的下载文件（避免编译报错）
-        find dl -size -1024c -exec ls -l {} \;
+        # 多线程下载+保存日志+校验包完整性
+        make download -j8 2>&1 | tee download.log
+        # 删除空的下载文件+重复包（避免编译报错）
         find dl -size -1024c -exec rm -f {} \;
+        find dl -name "*.tar.gz" -o -name "*.tar.xz" | sort | uniq -d | xargs -I {} rm -f {} 2>/dev/null
+        # OpenWrt内置校验，缺失包自动重下
+        make check-downloads 2>&1 | tee -a download.log
 
     - name: Pre-compile space check
       id: space_check
@@ -120,8 +125,8 @@ jobs:
         echo "Root directory free space: ${ROOT_FREE}MB (required: ${REQUIRED_FREE}MB)"
         if [ $ROOT_FREE -lt $REQUIRED_FREE ]; then
           echo "Warning: Insufficient space! Trying final cleanup..."
-          # 最后清理下载目录冗余文件
-          sudo rm -rf /workdir/openwrt/dl/* 2>/dev/null
+          # 最后清理下载目录冗余文件+临时目录
+          sudo rm -rf /workdir/openwrt/dl/* /workdir/tmp/* 2>/dev/null
           ROOT_FREE_AFTER=$(df -m / | awk 'NR==2 {print $4}')
           echo "Free space after final cleanup: ${ROOT_FREE_AFTER}MB"
           if [ $ROOT_FREE_AFTER -lt $REQUIRED_FREE ]; then
@@ -129,6 +134,7 @@ jobs:
             exit 1
           fi
         fi
+        echo "status=success" >> $GITHUB_OUTPUT
 
     - name: Compile the firmware
       id: compile
@@ -138,9 +144,9 @@ jobs:
         THREADS=$(( $(nproc) - 1 ))
         [ $THREADS -lt 1 ] && THREADS=1  # 确保至少1线程
         echo -e "${THREADS} thread compile (optimized for space)"
-        # 编译逻辑：降线程→单线程→详细日志，失败时清理残留
+        # 编译逻辑：降线程→单线程→详细日志，失败时打印关键日志
         COMPILE_SUCCESS=0
-        make -j$THREADS || (make clean && make -j1) || (make clean && make -j1 V=s)
+        make -j$THREADS 2>&1 | tee compile.log || (make clean && make -j1 2>&1 | tee -a compile.log) || (make clean && make -j1 V=s 2>&1 | tee -a compile.log)
         if [ $? -eq 0 ]; then
           COMPILE_SUCCESS=1
           echo "status=success" >> $GITHUB_OUTPUT
@@ -151,9 +157,11 @@ jobs:
           echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
         else
           echo "status=failure" >> $GITHUB_OUTPUT
-          # 打印失败时空间状态，便于排查
+          # 打印失败时关键信息（空间+最后失败包）
           echo "=== Disk space after compile failure ==="
-          df -hT /
+          df -hT / /workdir/tmp
+          echo "=== Last 20 lines of compile log ==="
+          grep -E "ERROR:.*failed to build|make.*: \*\*\*" compile.log | tail -20
           exit 1
         fi
 
@@ -167,6 +175,7 @@ jobs:
       with:
         name: OpenWrt_bin${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
         path: openwrt/bin
+        retention-days: 3  # 新增：Artifact保留3天
 
     # 整理编译好的固件
     - name: Organize files
@@ -174,8 +183,10 @@ jobs:
       if: env.UPLOAD_FIRMWARE == 'true' && !cancelled() && steps.compile.outputs.status == 'success'
       run: |
         cd openwrt/bin/targets/*/*
-        # 删除无用文件，减小上传体积
-        rm -rf packages *.buildinfo *.manifest *.json *bl2.bin
+        # 删除无用文件，减小上传体积（补充删除调试文件）
+        rm -rf packages *.buildinfo *.manifest *.json *bl2.bin */debug 2>/dev/null
+        # 仅保留最终刷写固件（sysupgrade/factory）
+        find . -type f ! -name "*.sysupgrade.bin" ! -name "*.factory.bin" -exec rm -f {} \; 2>/dev/null
         echo "FIRMWARE=$PWD" >> $GITHUB_ENV
         echo "status=success" >> $GITHUB_OUTPUT
 
@@ -185,6 +196,7 @@ jobs:
       with:
         name: OpenWrt_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
         path: ${{ env.FIRMWARE }}
+        retention-days: 3  # 新增：Artifact保留3天
 
     - name: Upload firmware to cowtransfer
       id: cowtransfer
@@ -208,10 +220,11 @@ jobs:
       id: tag
       if: env.UPLOAD_RELEASE == 'true' && !cancelled() && steps.compile.outputs.status == 'success'
       run: |
-        # 生成带设备型号和时间的标签
-        RELEASE_TAG=$(date +"%Y.%m.%d-%H%M")-immortalwrt24.10-6.6${{ env.DEVICE_NAME }}
+        # 生成带设备型号、时间、Commit哈希的唯一Tag（避免重复）
+        COMMIT_HASH=${{ github.sha::8 }}
+        RELEASE_TAG=$(date +"%Y.%m.%d-%H%M")-immortalwrt24.10-6.6${{ env.DEVICE_NAME }}-$COMMIT_HASH
         echo "release_tag=${RELEASE_TAG}" >> $GITHUB_OUTPUT
-        # 生成发布说明
+        # 生成发布说明（补充Commit信息）
         touch release.txt
         echo "cmcc_rax3000m-237大功率固件" >> release.txt
         echo "后台地址：192.168.6.1" >> release.txt
@@ -220,6 +233,7 @@ jobs:
         echo "默认主题：Argon" >> release.txt
         echo "集成插件：aria2、openlist2、diskman、lucky、ksmb、hd-idle、autoreboot、mtwifi-cfg" >> release.txt
         echo "编译源码：https://github.com/padavanonly/immortalwrt-mt798x-6.6" >> release.txt
+        echo "编译Commit：${{ github.sha }}（前8位：${COMMIT_HASH}）" >> release.txt  # 新增Commit信息
         echo "编译时间：$(date +"%Y-%m-%d %H:%M:%S %Z")" >> release.txt
         echo "status=success" >> $GITHUB_OUTPUT
 
