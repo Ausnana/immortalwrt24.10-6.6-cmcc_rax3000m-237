@@ -45,13 +45,12 @@ jobs:
       env:
         DEBIAN_FRONTEND: noninteractive
       run: |
-        # 原逻辑完整保留，仅新增临时目录重定向（解决/tmp空间不足）
         sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc
         sudo apt-get purge -y snapd firefox libreoffice* thunderbird
         sudo apt-get autoremove -y --purge
         sudo apt-get clean
         sudo rm -rf /var/cache/apt/archives/* /var/tmp/* /tmp/*
-        # 新增：重定向临时目录到/workdir（大分区），兼容原/tmp权限
+        # 临时目录重定向（解决/tmp空间不足）
         sudo mkdir -p /workdir/tmp && sudo chmod 1777 /workdir/tmp
         export TMPDIR=/workdir/tmp && echo "TMPDIR=/workdir/tmp" >> $GITHUB_ENV
         # 原逻辑继续
@@ -71,7 +70,7 @@ jobs:
         git clone $REPO_URL -b $REPO_BRANCH openwrt
         ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
 
-    # 新增：缓存工具链（减少重复编译，不影响原逻辑）
+    # 缓存工具链（减少重复编译）
     - name: Cache toolchain & core libs
       uses: actions/cache@v3
       with:
@@ -116,11 +115,11 @@ jobs:
       run: |
         cd openwrt
         make defconfig
-        # 新增：保存下载日志+校验包完整性
+        # 保存下载日志+校验包完整性
         make download -j8 2>&1 | tee download.log
         find dl -size -1024c -exec ls -l {} \;
         find dl -size -1024c -exec rm -f {} \;
-        make check-downloads  # 自动补全缺失包，避免编译报错
+        make check-downloads  # 自动补全缺失包
 
     - name: Pre-compile space check
       id: space_check
@@ -138,7 +137,7 @@ jobs:
             exit 1
           fi
         fi
-        # 新增：启动后台空间监控（编译中实时清理）
+        # 后台空间监控（编译中实时清理）
         echo "Start background space monitoring..."
         while true; do
           ROOT_FREE=$(df -m / | awk 'NR==2 {print $4}')
@@ -154,17 +153,16 @@ jobs:
       id: compile
       run: |
         cd openwrt
-        # 原线程逻辑保留，新增日志保存+内存适配 fallback
+        # 线程数计算（适配内存）
         THREADS=$(( $(nproc) - 1 ))
         [ $THREADS -lt 1 ] && THREADS=1
-        # 新增：适配小内存（<8GB时强制1线程）
         MEM_TOTAL=$(free -m | awk '/Mem:/ {print $2}')
-        [ $MEM_TOTAL -lt 8192 ] && THREADS=1
+        [ $MEM_TOTAL -lt 8192 ] && THREADS=1  # 小内存强制1线程
         echo -e "${THREADS} thread compile (optimized for space)"
-        # 新增：保存编译日志，便于排查
+        # 保存编译日志
         COMPILE_LOG="compile.log"
         make -j$THREADS 2>&1 | tee $COMPILE_LOG || (make clean && make -j1 2>&1 | tee -a $COMPILE_LOG) || (make clean && make -j1 V=s 2>&1 | tee -a $COMPILE_LOG)
-        # 原状态判断逻辑保留
+        # 状态判断
         if [ $? -eq 0 ]; then
           echo "status=success" >> $GITHUB_OUTPUT
           DEVICE=$(grep -m1 '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/')
@@ -176,10 +174,10 @@ jobs:
           df -hT /
           exit 1
         fi
-        # 新增：终止后台监控进程
+        # 终止后台监控
         kill -9 ${{ env.SPACE_MONITOR_PID }} 2>/dev/null
 
-    # 新增：编译失败时上传日志（不影响原流程）
+    # 编译失败上传日志
     - name: Upload compile log (on failure)
       uses: actions/upload-artifact@main
       if: steps.compile.outputs.status == 'failure' && !cancelled()
@@ -198,14 +196,14 @@ jobs:
       with:
         name: OpenWrt_bin${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
         path: openwrt/bin
-        retention-days: 3  # 新增：避免Artifact堆积
+        retention-days: 3
 
     - name: Organize files
       id: organize
       if: env.UPLOAD_FIRMWARE == 'true' && !cancelled() && steps.compile.outputs.status == 'success'
       run: |
         cd openwrt/bin/targets/*/*
-        # 原清理逻辑保留，新增删除调试文件（减少体积）
+        # 清理无用文件（含调试目录）
         rm -rf packages *.buildinfo *.manifest *.json *bl2.bin */debug 2>/dev/null
         echo "FIRMWARE=$PWD" >> $GITHUB_ENV
         echo "status=success" >> $GITHUB_OUTPUT
@@ -216,7 +214,7 @@ jobs:
       with:
         name: OpenWrt_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
         path: ${{ env.FIRMWARE }}
-        retention-days: 3  # 新增：避免Artifact堆积
+        retention-days: 3
 
     - name: Upload firmware to cowtransfer
       id: cowtransfer
@@ -240,11 +238,11 @@ jobs:
       id: tag
       if: env.UPLOAD_RELEASE == 'true' && !cancelled() && steps.compile.outputs.status == 'success'
       run: |
-        # 原Tag逻辑保留，新增Commit信息（避免重复）
-        COMMIT_HASH=${{ github.sha::8 }}
+        # 修复：Commit哈希截取语法（::改为[:）
+        COMMIT_HASH=${{ github.sha[:8] }}
         RELEASE_TAG=$(date +"%Y.%m.%d-%H%M")-immortalwrt24.10-6.6${{ env.DEVICE_NAME }}-$COMMIT_HASH
         echo "release_tag=${RELEASE_TAG}" >> $GITHUB_OUTPUT
-        # 原发布说明保留，新增编译环境信息
+        # 发布说明（含Commit信息）
         touch release.txt
         echo "cmcc_rax3000m-237大功率固件" >> release.txt
         echo "后台地址：192.168.6.1" >> release.txt
@@ -253,7 +251,7 @@ jobs:
         echo "默认主题：Argon" >> release.txt
         echo "集成插件：aria2、openlist2、diskman、lucky、ksmb、hd-idle、autoreboot、mtwifi-cfg" >> release.txt
         echo "编译源码：https://github.com/padavanonly/immortalwrt-mt798x-6.6" >> release.txt
-        echo "编译Commit：${{ github.sha }}（前8位：${COMMIT_HASH}）" >> release.txt  # 新增
+        echo "编译Commit：${{ github.sha }}（前8位：${COMMIT_HASH}）" >> release.txt
         echo "编译时间：$(date +"%Y-%m-%d %H:%M:%S %Z")" >> release.txt
         echo "status=success" >> $GITHUB_OUTPUT
 
