@@ -8,7 +8,7 @@
 # Description: Build OpenWrt using GitHub Actions
 #
 
-name: Build OpenWrt
+name: 构建OpenWrt固件
 
 permissions:
   contents: write
@@ -42,10 +42,10 @@ jobs:
     runs-on: ubuntu-22.04
 
     steps:
-    - name: Checkout
+    - name: 检出代码
       uses: actions/checkout@main
 
-    - name: Initialization environment
+    - name: 初始化环境
       env:
         DEBIAN_FRONTEND: noninteractive
       run: |
@@ -53,6 +53,8 @@ jobs:
         sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc
         sudo apt-get purge -y snapd firefox libreoffice* thunderbird
         sudo rm -rf /var/cache/apt/archives/* /var/tmp/* /tmp/*
+        # 新增：安装 geoview 依赖的开发库
+        sudo -E apt-get -qq install libcurl4-openssl-dev libjson-c-dev zlib1g-dev
         # 重定向临时目录到/workdir（解决/tmp空间不足）
         sudo mkdir -p /workdir/tmp && sudo chmod 1777 /workdir/tmp
         export TMPDIR=/workdir/tmp && echo "TMPDIR=/workdir/tmp" >> $GITHUB_ENV
@@ -71,7 +73,7 @@ jobs:
         sudo mkdir -p /workdir
         sudo chown $USER:$GROUPS /workdir
 
-    - name: Clone source code
+    - name: 克隆源码
       working-directory: /workdir
       run: |
         df -hT $PWD
@@ -79,7 +81,7 @@ jobs:
         ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
 
     # 工具链缓存（排除Python3相关缓存，避免旧缓存干扰）
-    - name: Cache toolchain & core libs
+    - name: 缓存工具链与核心库
       uses: actions/cache@v3
       with:
         path: |
@@ -91,20 +93,20 @@ jobs:
           ${{ runner.os }}-openwrt-cache-${{ env.REPO_BRANCH }}-
           ${{ runner.os }}-openwrt-cache-
 
-    - name: Load custom feeds
+    - name: 加载自定义Feeds
       run: |
         [ -e "$FEEDS_CONF" ] && mv "$FEEDS_CONF" openwrt/feeds.conf.default
         chmod +x "$DIY_P1_SH"
         cd openwrt
         "$GITHUB_WORKSPACE/$DIY_P1_SH"
 
-    - name: Update feeds
+    - name: 更新Feeds
       run: cd openwrt && ./scripts/feeds update -a
 
-    - name: Install feeds
+    - name: 安装Feeds
       run: cd openwrt && ./scripts/feeds install -a
 
-    - name: Load custom configuration
+    - name: 加载自定义配置
       run: |
         [ -d "files" ] && mv "files" openwrt/files
         [ -e "$CONFIG_FILE" ] && mv "$CONFIG_FILE" openwrt/.config
@@ -113,14 +115,14 @@ jobs:
         "$GITHUB_WORKSPACE/$DIY_P2_SH"
 
     # SSH连接（便于调试Python3编译问题）
-    - name: SSH connection to Actions
+    - name: SSH连接到Actions环境
       uses: P3TERX/ssh2actions@v1.0.0
       if: fromJSON(github.event.inputs.ssh || 'false') || contains(github.event.action, 'ssh')
       env:
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
 
-    - name: Download package
+    - name: 下载软件包
       id: package
       run: |
         cd openwrt
@@ -134,7 +136,7 @@ jobs:
         fi
 
     # 编译前空间检查
-    - name: Pre-compile space check
+    - name: 编译前空间检查
       id: space_check
       run: |
         ROOT_FREE=$(df -m / | awk 'NR==2 {print $4}')
@@ -156,7 +158,7 @@ jobs:
         done &
         echo "SPACE_MONITOR_PID=$!" >> $GITHUB_ENV
 
-    - name: Compile the firmware（核心修复：优化Python3 Host编译）
+    - name: 编译固件（核心修复：优化Python3 Host编译）
       id: compile
       run: |
         cd openwrt
@@ -201,7 +203,7 @@ jobs:
         kill -9 "${{ env.SPACE_MONITOR_PID }}" 2>/dev/null
 
     # 编译失败上传日志（包含Python3 Host日志）
-    - name: Upload compile log (on failure)
+    - name: （编译失败时）上传编译日志
       uses: actions/upload-artifact@main
       if: failure() && !cancelled()
       with:
@@ -212,11 +214,11 @@ jobs:
           /workdir/openwrt/python3-host-compile.log  # 单独上传Python3 Host日志
         retention-days: 3
 
-    - name: Check space usage
+    - name: 检查空间使用情况
       if: (!cancelled())
       run: df -hT
 
-    - name: Upload bin directory
+    - name: 上传bin目录
       uses: actions/upload-artifact@main
       if: steps.compile.outputs.status == 'success' && env.UPLOAD_BIN_DIR == 'true'
       with:
@@ -225,7 +227,7 @@ jobs:
         retention-days: 3
 
     # 整理编译好的固件（不限制格式）
-    - name: Organize files
+    - name: 整理固件文件
       id: organize
       if: env.UPLOAD_FIRMWARE == 'true' && !cancelled()
       run: |
@@ -245,7 +247,7 @@ jobs:
         echo "FIRMWARE=$PWD" >> $GITHUB_ENV
         echo "status=success" >> $GITHUB_OUTPUT
 
-    - name: Upload firmware directory
+    - name: 上传固件目录
       uses: actions/upload-artifact@main
       if: steps.organize.outputs.status == 'success' && !cancelled()
       with:
@@ -253,7 +255,7 @@ jobs:
         path: ${{ env.FIRMWARE }}/*
         retention-days: 3
 
-    - name: Upload firmware to cowtransfer
+    - name: 上传固件到奶牛快传
       id: cowtransfer
       if: steps.organize.outputs.status == 'success' && env.UPLOAD_COWTRANSFER == 'true' && !cancelled()
       run: |
@@ -262,7 +264,7 @@ jobs:
         echo "::warning file=cowtransfer.com::$(cat cowtransfer.log | grep https)"
         echo "url=$(cat cowtransfer.log | grep https | cut -f3 -d" ")" >> $GITHUB_OUTPUT
 
-    - name: Upload firmware to WeTransfer
+    - name: 上传固件到WeTransfer
       id: wetransfer
       if: steps.organize.outputs.status == 'success' && env.UPLOAD_WETRANSFER == 'true' && !cancelled()
       run: |
@@ -271,7 +273,7 @@ jobs:
         echo "::warning file=wetransfer.com::$(cat wetransfer.log | grep https)"
         echo "url=$(cat wetransfer.log | grep https | cut -f3 -d" ")" >> $GITHUB_OUTPUT
 
-    - name: Generate release tag
+    - name: 生成发布标签
       id: tag
       if: env.UPLOAD_RELEASE == 'true' && !cancelled()
       run: |
@@ -292,7 +294,7 @@ jobs:
         echo "- 编译时间：$(date +"%Y-%m-%d %H:%M:%S %Z")" >> release.txt
         echo "status=success" >> $GITHUB_OUTPUT
 
-    - name: Upload firmware to release
+    - name: 上传固件到发布页
       uses: softprops/action-gh-release@v1
       if: steps.tag.outputs.status == 'success' && !cancelled()
       env:
@@ -305,7 +307,7 @@ jobs:
         prerelease: false
       timeout-minutes: 5
 
-    - name: Delete workflow runs
+    - name: 删除工作流运行记录
       uses: GitRML/delete-workflow-runs@main
       with:
         retain_days: 1
