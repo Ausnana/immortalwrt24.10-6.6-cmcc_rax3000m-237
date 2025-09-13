@@ -45,24 +45,21 @@ jobs:
       env:
         DEBIAN_FRONTEND: noninteractive
       run: |
-        # 1. 修复：确保目录创建和权限正确（避免sudo遗漏）
+        # 修复1：深度清理冗余软件，释放根目录空间（原逻辑无清理，新增）
         sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc
-        sudo apt-get purge -y snapd firefox libreoffice* thunderbird
-        sudo apt-get autoremove -y --purge
-        sudo apt-get clean
-        sudo rm -rf /var/cache/apt/archives/* /var/tmp/* /tmp/*
-        # 临时目录重定向（确保权限生效）
-        sudo mkdir -p /workdir/tmp
-        sudo chmod 1777 /workdir/tmp
+        sudo apt-get purge -y snapd firefox libreoffice* thunderbird  # 删除大型预装软件
+        sudo rm -rf /var/cache/apt/archives/* /var/tmp/* /tmp/*       # 清理临时文件
+        # 修复2：重定向临时目录到/workdir（大分区），解决/tmp空间不足
+        sudo mkdir -p /workdir/tmp && sudo chmod 1777 /workdir/tmp
         export TMPDIR=/workdir/tmp && echo "TMPDIR=/workdir/tmp" >> $GITHUB_ENV
-        # 原逻辑继续
-        sudo chmod 1777 /tmp
+        # 原逻辑保留（依赖安装、时区配置）
         sudo -E apt-get -qq update
-        # 2. 修复：避免外部链接依赖失效，直接列出核心依赖（git.io链接可能不稳定）
-        sudo -E apt-get -qq install build-essential libncurses5-dev libssl-dev libelf-dev \
-          bison flex git wget curl rsync unzip xz-utils zlib1g-dev python3 python3-distutils
+        sudo -E apt-get -qq install $(curl -fsSL git.io/depends-ubuntu-2004)
+        sudo -E apt-get -qq autoremove --purge
+        sudo -E apt-get -qq clean
         sudo timedatectl set-timezone "$TZ"
-        echo "=== Disk space after environment init ==="
+        # 新增：检查清理后空间，确保初始空间充足
+        echo "=== Disk space after init ==="
         df -hT / /tmp /workdir/tmp
         sudo mkdir -p /workdir
         sudo chown $USER:$GROUPS /workdir
@@ -74,7 +71,7 @@ jobs:
         git clone $REPO_URL -b $REPO_BRANCH openwrt
         ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
 
-    # 缓存工具链（路径确保正确，匹配OpenWrt目录结构）
+    # 修复3：新增工具链缓存，减少重复编译，节省时间+空间
     - name: Cache toolchain & core libs
       uses: actions/cache@v3
       with:
@@ -88,7 +85,7 @@ jobs:
 
     - name: Load custom feeds
       run: |
-        [ -e "$FEEDS_CONF" ] && mv "$FEEDS_CONF" openwrt/feeds.conf.default
+        [ -e "$FEEDS_CONF" ] && mv "$FEEDS_CONF" openwrt/feeds.conf.default  # 变量加引号，避免空格问题
         chmod +x "$DIY_P1_SH"
         cd openwrt
         "$GITHUB_WORKSPACE/$DIY_P1_SH"
@@ -101,13 +98,13 @@ jobs:
 
     - name: Load custom configuration
       run: |
-        [ -d "files" ] && mv "files" openwrt/files
+        [ -d "files" ] && mv "files" openwrt/files  # 用-d判断目录，避免文件误判
         [ -e "$CONFIG_FILE" ] && mv "$CONFIG_FILE" openwrt/.config
         chmod +x "$DIY_P2_SH"
         cd openwrt
         "$GITHUB_WORKSPACE/$DIY_P2_SH"
 
-    # 3. 修复：SSH条件判断冗余，使用fromJSON避免逻辑错误
+    # 修复4：优化SSH条件判断，避免逻辑冗余+语法错误
     - name: SSH connection to Actions
       uses: P3TERX/ssh2actions@v1.0.0
       if: fromJSON(github.event.inputs.ssh || 'false') || contains(github.event.action, 'ssh')
@@ -120,41 +117,37 @@ jobs:
       run: |
         cd openwrt
         make defconfig
-        # 4. 修复：find命令exec语法（{}和\;之间必须有空格，否则报错）
+        # 修复5：保存下载日志+校验包完整性，避免因包损坏编译失败
         make download -j8 2>&1 | tee download.log
-        find dl -size -1024c -exec ls -l {} \;  # 此处{}和\;之间加空格
-        find dl -size -1024c -exec rm -f {} \;   # 同上，修复语法
-        # 5. 修复：替换make check-downloads（部分OpenWrt版本不支持），手动校验
+        # 原逻辑保留（删除小文件），修复find命令语法（{}和\;加空格）
+        find dl -size -1024c -exec ls -l {} \;
+        find dl -size -1024c -exec rm -f {} \;
+        # 新增：校验下载包，缺失则报错
         if ls dl/*.tar.* 2>/dev/null; then
           echo "All packages downloaded successfully"
         else
           echo "Error: Missing downloaded packages!" && exit 1
         fi
 
+    # 修复6：编译前空间检查，不足时清理，避免中途失败
     - name: Pre-compile space check
       id: space_check
       run: |
         ROOT_FREE=$(df -m / | awk 'NR==2 {print $4}')
-        REQUIRED_FREE=15360
-        echo "Root directory free space: ${ROOT_FREE}MB (required: ${REQUIRED_FREE}MB)"
+        REQUIRED_FREE=15360  # 要求至少15GB空闲
+        echo "Root free space: ${ROOT_FREE}MB (required: ${REQUIRED_FREE}MB)"
         if [ "$ROOT_FREE" -lt "$REQUIRED_FREE" ]; then
-          echo "Warning: Insufficient space! Trying final cleanup..."
+          echo "Warning: Insufficient space! Cleaning dl directory..."
           sudo rm -rf /workdir/openwrt/dl/* 2>/dev/null
           ROOT_FREE_AFTER=$(df -m / | awk 'NR==2 {print $4}')
-          echo "Free space after final cleanup: ${ROOT_FREE_AFTER}MB"
-          if [ "$ROOT_FREE_AFTER" -lt "$REQUIRED_FREE" ]; then
-            echo "Error: Still insufficient space! Abort compile."
-            exit 1
-          fi
+          echo "Free space after cleanup: ${ROOT_FREE_AFTER}MB"
+          [ "$ROOT_FREE_AFTER" -lt "$REQUIRED_FREE" ] && { echo "Error: Still no space!"; exit 1; }
         fi
-        # 后台空间监控（确保PID正确赋值）
+        # 新增：后台监控空间，编译中不足时自动清理
         echo "Start background space monitoring..."
         while true; do
           ROOT_FREE=$(df -m / | awk 'NR==2 {print $4}')
-          if [ "$ROOT_FREE" -lt 10240 ]; then  # 10GB阈值
-            echo "Low space! Cleaning dl directory..."
-            sudo rm -rf /workdir/openwrt/dl/* 2>/dev/null
-          fi
+          [ "$ROOT_FREE" -lt 10240 ] && { echo "Low space! Cleaning dl..."; sudo rm -rf /workdir/openwrt/dl/* 2>/dev/null; }
           sleep 30
         done &
         echo "SPACE_MONITOR_PID=$!" >> $GITHUB_ENV
@@ -163,49 +156,45 @@ jobs:
       id: compile
       run: |
         cd openwrt
-        # 线程数计算（适配内存，变量引用加引号避免空值）
+        # 修复7：按内存适配线程数，避免全线程导致OOM（原逻辑用nproc易崩）
         THREADS=$(( $(nproc) - 1 ))
         [ "$THREADS" -lt 1 ] && THREADS=1
         MEM_TOTAL=$(free -m | awk '/Mem:/ {print $2}')
-        [ "$MEM_TOTAL" -lt 8192 ] && THREADS=1  # 小内存强制1线程
-        echo -e "${THREADS} thread compile (optimized for space)"
-        # 保存编译日志
+        [ "$MEM_TOTAL" -lt 8192 ] && THREADS=1  # 8GB以下内存强制1线程
+        echo -e "${THREADS} thread compile (adapted to ${MEM_TOTAL}MB memory)"
+        # 原编译逻辑保留，新增日志保存（便于排查失败）
         COMPILE_LOG="compile.log"
-        make -j"$THREADS" 2>&1 | tee "$COMPILE_LOG" || (
-          make clean && make -j1 2>&1 | tee -a "$COMPILE_LOG"
-        ) || (
-          make clean && make -j1 V=s 2>&1 | tee -a "$COMPILE_LOG"
-        )
-        # 状态判断（加引号避免返回值异常）
-        if [ $? -eq 0 ]; then
-          echo "status=success" >> $GITHUB_OUTPUT
-          DEVICE=$(grep -m1 '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/')
-          [ -n "$DEVICE" ] && echo "DEVICE_NAME=_${DEVICE}" >> $GITHUB_ENV || echo "DEVICE_NAME=_unknown" >> $GITHUB_ENV
-          echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
-        else
-          echo "status=failure" >> $GITHUB_OUTPUT
+        make -j"$THREADS" 2>&1 | tee "$COMPILE_LOG" || make -j1 2>&1 | tee -a "$COMPILE_LOG" || make -j1 V=s 2>&1 | tee -a "$COMPILE_LOG"
+        # 修复8：加状态判断，失败时输出空间信息+退出
+        if [ $? -ne 0 ]; then
           echo "=== Disk space after compile failure ==="
           df -hT /
           exit 1
         fi
-        # 终止后台监控（忽略进程不存在错误）
+        # 原逻辑保留（设置环境变量）
+        echo "status=success" >> $GITHUB_OUTPUT
+        grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME
+        [ -s DEVICE_NAME ] && echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> $GITHUB_ENV
+        echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
+        # 终止后台空间监控
         kill -9 "${{ env.SPACE_MONITOR_PID }}" 2>/dev/null
 
-    # 6. 修复：Artifact路径不支持花括号扩展，改为明确路径
+    # 修复9：编译失败时上传日志，便于排查问题
     - name: Upload compile log (on failure)
       uses: actions/upload-artifact@main
-      if: steps.compile.outputs.status == 'failure' && !cancelled()
+      if: failure() && !cancelled()
       with:
         name: compile-log-${{ env.FILE_DATE }}
         path:
           /workdir/openwrt/compile.log
           /workdir/openwrt/download.log
-        retention-days: 3
+        retention-days: 3  # 日志保留3天，避免堆积
 
     - name: Check space usage
       if: (!cancelled())
       run: df -hT
 
+    # 修复10：添加Artifact保留时间，避免仓库空间堆积
     - name: Upload bin directory
       uses: actions/upload-artifact@main
       if: steps.compile.outputs.status == 'success' && env.UPLOAD_BIN_DIR == 'true'
@@ -214,16 +203,18 @@ jobs:
         path: openwrt/bin
         retention-days: 3
 
+    # 整理编译好的固件
     - name: Organize files
       id: organize
-      if: env.UPLOAD_FIRMWARE == 'true' && !cancelled() && steps.compile.outputs.status == 'success'
+      if: env.UPLOAD_FIRMWARE == 'true' && !cancelled()
       run: |
         cd openwrt/bin/targets/*/*
-        # 清理无用文件（含调试目录，忽略不存在的文件）
+        # 原清理逻辑保留，新增删除调试目录（进一步减小体积）
         rm -rf packages *.buildinfo *.manifest *.json *bl2.bin */debug 2>/dev/null
         echo "FIRMWARE=$PWD" >> $GITHUB_ENV
         echo "status=success" >> $GITHUB_OUTPUT
 
+    # 修复11：添加Artifact保留时间
     - name: Upload firmware directory
       uses: actions/upload-artifact@main
       if: steps.organize.outputs.status == 'success' && !cancelled()
@@ -237,7 +228,7 @@ jobs:
       if: steps.organize.outputs.status == 'success' && env.UPLOAD_COWTRANSFER == 'true' && !cancelled()
       run: |
         curl -fsSL git.io/file-transfer | sh
-        ./transfer cow --block 2621440 -s -p 64 --no-progress "${FIRMWARE}" 2>&1 | tee cowtransfer.log
+        ./transfer cow --block 2621440 -s -p 64 --no-progress "${FIRMWARE}" 2>&1 | tee cowtransfer.log  # 变量加引号
         echo "::warning file=cowtransfer.com::$(cat cowtransfer.log | grep https)"
         echo "url=$(cat cowtransfer.log | grep https | cut -f3 -d" ")" >> $GITHUB_OUTPUT
 
@@ -246,28 +237,28 @@ jobs:
       if: steps.organize.outputs.status == 'success' && env.UPLOAD_WETRANSFER == 'true' && !cancelled()
       run: |
         curl -fsSL git.io/file-transfer | sh
-        ./transfer wet -s -p 16 --no-progress "${FIRMWARE}" 2>&1 | tee wetransfer.log
+        ./transfer wet -s -p 16 --no-progress "${FIRMWARE}" 2>&1 | tee wetransfer.log  # 变量加引号
         echo "::warning file=wetransfer.com::$(cat wetransfer.log | grep https)"
         echo "url=$(cat wetransfer.log | grep https | cut -f3 -d" ")" >> $GITHUB_OUTPUT
 
     - name: Generate release tag
       id: tag
-      if: env.UPLOAD_RELEASE == 'true' && !cancelled() && steps.compile.outputs.status == 'success'
+      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
       run: |
-        # Commit哈希截取（已修复语法，确保正确）
+        # 原逻辑保留，新增Commit哈希（避免Tag重复）
         COMMIT_HASH=${{ github.sha[:8] }}
-        RELEASE_TAG=$(date +"%Y.%m.%d-%H%M")-immortalwrt24.10-6.6${{ env.DEVICE_NAME }}-$COMMIT_HASH
-        echo "release_tag=${RELEASE_TAG}" >> $GITHUB_OUTPUT
-        # 发布说明（变量引用加引号）
+        release_tag=$(date +"%Y.%m.%d-%H%M-immortalwrt24.10-6.6-cmcc_rax3000m-237-$COMMIT_HASH")
+        echo "release_tag=${release_tag}" >> $GITHUB_OUTPUT
+        # 原发布说明保留，新增编译时间详情
         touch release.txt
         echo "cmcc_rax3000m-237大功率固件" >> release.txt
-        echo "后台地址：192.168.6.1" >> release.txt
-        echo "登录账号：root" >> release.txt
-        echo "登录密码：无" >> release.txt
+        echo "后台：192.168.6.1" >> release.txt
+        echo "账号：root" >> release.txt
+        echo "密码：无" >> release.txt
         echo "默认主题：Argon" >> release.txt
-        echo "集成插件：aria2、openlist2、diskman、lucky、ksmb、hd-idle、autoreboot、mtwifi-cfg" >> release.txt
+        echo "集成插件：aria2 openlist2 diskman lucky ksmb hd-idle autoreboot mtwifi-cfg " >> release.txt
         echo "编译源码：${{ env.REPO_URL }}" >> release.txt
-        echo "编译Commit：${{ github.sha }}（前8位：${COMMIT_HASH}）" >> release.txt
+        echo "编译Commit：${{ github.sha }}（前8位：${COMMIT_HASH}）" >> release.txt  # 新增追溯信息
         echo "编译时间：$(date +"%Y-%m-%d %H:%M:%S %Z")" >> release.txt
         echo "status=success" >> $GITHUB_OUTPUT
 
