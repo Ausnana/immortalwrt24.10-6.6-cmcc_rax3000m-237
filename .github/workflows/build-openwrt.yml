@@ -10,6 +10,11 @@
 
 name: Build OpenWrt
 
+# 修复1：显式声明权限，解决403权限不足（创建Release需要contents:write）
+permissions:
+  contents: write  # 授予创建/上传Release的权限
+  actions: write   # 辅助删除旧工作流，避免冲突
+
 on:
   repository_dispatch:
   workflow_dispatch:
@@ -167,8 +172,9 @@ jobs:
           exit 1
         fi
         echo "status=success" >> $GITHUB_OUTPUT
-        grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME
-        [ -s DEVICE_NAME ] && echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> $GITHUB_ENV
+        # 提取设备名（确保匹配实际固件目录）
+        DEVICE=$(grep -m1 '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/')
+        [ -n "$DEVICE" ] && echo "DEVICE_NAME=_${DEVICE}" >> $GITHUB_ENV || echo "DEVICE_NAME=_unknown" >> $GITHUB_ENV
         echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
         # 终止后台监控
         kill -9 "${{ env.SPACE_MONITOR_PID }}" 2>/dev/null
@@ -196,13 +202,25 @@ jobs:
         path: openwrt/bin
         retention-days: 3
 
-    # 整理编译好的固件
+    # 整理编译好的固件（修复2：确认固件路径，避免误删）
     - name: Organize files
       id: organize
       if: env.UPLOAD_FIRMWARE == 'true' && !cancelled()
       run: |
-        cd openwrt/bin/targets/*/*
+        # 进入固件目录（mediatek/filogic，适配MT798x芯片）
+        cd openwrt/bin/targets/mediatek/filogic
+        # 打印目录内容，确认固件存在（便于调试路径问题）
+        echo "=== Firmware directory contents ==="
+        ls -lha
+        # 清理无用文件，保留核心固件（.bin文件）
         rm -rf packages *.buildinfo *.manifest *.json *bl2.bin */debug 2>/dev/null
+        # 确认固件文件存在，否则报错
+        if ! ls *.bin 2>/dev/null; then
+          echo "Error: No firmware .bin files found!"
+          ls -lha  # 再次打印目录，排查文件位置
+          exit 1
+        fi
+        # 设置FIRMWARE变量为当前目录（确保后续上传能找到）
         echo "FIRMWARE=$PWD" >> $GITHUB_ENV
         echo "status=success" >> $GITHUB_OUTPUT
 
@@ -211,7 +229,7 @@ jobs:
       if: steps.organize.outputs.status == 'success' && !cancelled()
       with:
         name: OpenWrt_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
-        path: ${{ env.FIRMWARE }}
+        path: ${{ env.FIRMWARE }}/*.bin  # 明确上传.bin固件，避免路径模糊
         retention-days: 3
 
     - name: Upload firmware to cowtransfer
@@ -219,7 +237,7 @@ jobs:
       if: steps.organize.outputs.status == 'success' && env.UPLOAD_COWTRANSFER == 'true' && !cancelled()
       run: |
         curl -fsSL git.io/file-transfer | sh
-        ./transfer cow --block 2621440 -s -p 64 --no-progress "${FIRMWARE}" 2>&1 | tee cowtransfer.log
+        ./transfer cow --block 2621440 -s -p 64 --no-progress "${FIRMWARE}/*.bin" 2>&1 | tee cowtransfer.log
         echo "::warning file=cowtransfer.com::$(cat cowtransfer.log | grep https)"
         echo "url=$(cat cowtransfer.log | grep https | cut -f3 -d" ")" >> $GITHUB_OUTPUT
 
@@ -228,7 +246,7 @@ jobs:
       if: steps.organize.outputs.status == 'success' && env.UPLOAD_WETRANSFER == 'true' && !cancelled()
       run: |
         curl -fsSL git.io/file-transfer | sh
-        ./transfer wet -s -p 16 --no-progress "${FIRMWARE}" 2>&1 | tee wetransfer.log
+        ./transfer wet -s -p 16 --no-progress "${FIRMWARE}/*.bin" 2>&1 | tee wetransfer.log
         echo "::warning file=wetransfer.com::$(cat wetransfer.log | grep https)"
         echo "url=$(cat wetransfer.log | grep https | cut -f3 -d" ")" >> $GITHUB_OUTPUT
 
@@ -236,22 +254,26 @@ jobs:
       id: tag
       if: env.UPLOAD_RELEASE == 'true' && !cancelled()
       run: |
-        # 修复：用Shell命令截取SHA前8位（替代不支持的[:8]语法）
+        # 用Shell命令截取SHA前8位（兼容Actions语法）
         COMMIT_HASH=$(echo ${{ github.sha }} | cut -c1-8)
-        release_tag=$(date +"%Y.%m.%d-%H%M-immortalwrt24.10-6.6-cmcc_rax3000m-237-$COMMIT_HASH")
+        # 生成唯一Tag（含设备名+SHA，避免重复）
+        release_tag=$(date +"%Y.%m.%d-%H%M-immortalwrt24.10-6.6${{ env.DEVICE_NAME }}-$COMMIT_HASH")
         echo "release_tag=${release_tag}" >> $GITHUB_OUTPUT
+        # 生成详细发布说明
         touch release.txt
-        echo "cmcc_rax3000m-237大功率固件" >> release.txt
-        echo "后台：192.168.6.1" >> release.txt
-        echo "账号：root" >> release.txt
-        echo "密码：无" >> release.txt
-        echo "默认主题：Argon" >> release.txt
-        echo "集成插件：aria2 openlist2 diskman lucky ksmb hd-idle autoreboot mtwifi-cfg " >> release.txt
-        echo "编译源码：${{ env.REPO_URL }}" >> release.txt
-        echo "编译Commit：${{ github.sha }}（前8位：${COMMIT_HASH}）" >> release.txt
-        echo "编译时间：$(date +"%Y-%m-%d %H:%M:%S %Z")" >> release.txt
+        echo "### cmcc_rax3000m-237 大功率固件" >> release.txt
+        echo "- 后台地址：192.168.6.1" >> release.txt
+        echo "- 登录账号：root" >> release.txt
+        echo "- 登录密码：无" >> release.txt
+        echo "- 默认主题：Argon" >> release.txt
+        echo "- 集成插件：aria2、openlist2、diskman、lucky、ksmb、hd-idle、autoreboot、mtwifi-cfg" >> release.txt
+        echo "- 编译源码：${{ env.REPO_URL }} (分支：${{ env.REPO_BRANCH }})" >> release.txt
+        echo "- 编译Commit：${{ github.sha }}（前8位：${COMMIT_HASH}）" >> release.txt
+        echo "- 固件文件：$(ls ${FIRMWARE}/*.bin | xargs -n1 basename)" >> release.txt  # 列出固件文件名
+        echo "- 编译时间：$(date +"%Y-%m-%d %H:%M:%S %Z")" >> release.txt
         echo "status=success" >> $GITHUB_OUTPUT
 
+    # 修复3：明确上传.bin文件，避免路径匹配失败；添加重试机制与错误提示
     - name: Upload firmware to release
       uses: softprops/action-gh-release@v1
       if: steps.tag.outputs.status == 'success' && !cancelled()
@@ -260,7 +282,11 @@ jobs:
       with:
         tag_name: ${{ steps.tag.outputs.release_tag }}
         body_path: release.txt
-        files: ${{ env.FIRMWARE }}/*
+        files: ${{ env.FIRMWARE }}/*.bin  # 精确匹配.bin固件，替代模糊的/*
+        draft: false  # 不创建草稿，直接发布
+        prerelease: false
+      timeout-minutes: 5  # 超时时间5分钟，避免无限等待
+      continue-on-error: false  # 失败时终止，便于排查
 
     - name: Delete workflow runs
       uses: GitRML/delete-workflow-runs@main
