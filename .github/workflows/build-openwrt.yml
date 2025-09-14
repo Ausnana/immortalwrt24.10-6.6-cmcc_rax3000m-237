@@ -391,9 +391,13 @@ jobs:
         COMMIT_HASH=$(echo ${{ github.sha }} | cut -c1-8)
         release_tag=$(date +"%Y.%m.%d-%H%M-immortalwrt24.10-6.6${{ env.DEVICE_NAME }}-$COMMIT_HASH")
         
-        # 生成发布说明：用正则替换去掉DEVICE_NAME开头的下划线（修复语法错误）
+        # 关键修复：用Bash语法去掉DEVICE_NAME开头的下划线（避开YAML的|符号冲突）
+        CLEAN_DEVICE_NAME="${{ env.DEVICE_NAME }}"
+        CLEAN_DEVICE_NAME="${CLEAN_DEVICE_NAME#_}"  # Bash语法：删除开头的第一个_
+        
+        # 生成发布说明（引用处理后的设备名）
         touch release.txt
-        echo "### ImmortalWrt 固件发布（${{ env.DEVICE_NAME | regexReplaceAll('^_', '') }}）" >> release.txt
+        echo "### ImmortalWrt 固件发布（${CLEAN_DEVICE_NAME}）" >> release.txt
         echo "- 后台地址：http://192.168.6.1 或 http://immortalwrt.lan" >> release.txt
         echo "- 登录账号：root" >> release.txt
         echo "- 登录密码：无（首次登录需设置）" >> release.txt
