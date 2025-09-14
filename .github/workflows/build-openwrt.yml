@@ -104,7 +104,10 @@ jobs:
       run: cd openwrt && ./scripts/feeds update -a
 
     - name: 安装Feeds
-      run: cd openwrt && ./scripts/feeds install -a
+      run: |
+        cd openwrt && ./scripts/feeds install -a
+        # 修复2：单独安装Python3包（确保不被Feeds优先级覆盖或遗漏）
+        cd openwrt && ./scripts/feeds install python3
 
     - name: 加载自定义配置
       run: |
@@ -169,13 +172,28 @@ jobs:
         [ "$MEM_TOTAL" -lt 8192 ] && THREADS=1
         echo -e "${THREADS} thread compile (adapted to ${MEM_TOTAL}MB memory)"
         
-        # 修复2：先单独单线程编译Python3 Host（避免多线程资源冲突，关键！）
-        echo "=== First compile Python3 [host] with single thread ==="
-        make -j1 package/feeds/packages/python3/host-compile V=s 2>&1 | tee python3-host-compile.log
+        # 修复3：前置编译Binutils（解决工具链依赖问题，单线程避免冲突）
+        echo "=== First compile Binutils (toolchain) with single thread ==="
+        make -j1 toolchain/binutils/compile V=s 2>&1 | tee binutils-compile.log
         if [ $? -ne 0 ]; then
-          echo "Error: Python3 [host] compile failed! Check python3-host-compile.log"
-          cat python3-host-compile.log  # 打印详细错误日志，便于排查
+          echo "Error: Binutils compile failed! Check binutils-compile.log"
+          cat binutils-compile.log
           exit 1
+        fi
+        
+        # 修复4：Python3 Host编译路径兼容（先试原路径，失败用备选路径）
+        echo "=== First compile Python3 [host] with single thread ==="
+        PYTHON_HOST_TARGET1="package/feeds/packages/python3/host-compile"
+        PYTHON_HOST_TARGET2="package/python3/host/compile"  # 备选路径（适配多数OpenWRT版本）
+        if make -j1 $PYTHON_HOST_TARGET1 V=s 2>&1 | tee python3-host-compile.log; then
+          echo "Python3 Host compiled with target: $PYTHON_HOST_TARGET1"
+        else
+          echo "Retry with alternative target: $PYTHON_HOST_TARGET2"
+          if ! make -j1 $PYTHON_HOST_TARGET2 V=s 2>&1 | tee -a python3-host-compile.log; then
+            echo "Error: Python3 [host] compile failed! Check python3-host-compile.log"
+            cat python3-host-compile.log
+            exit 1
+          fi
         fi
         
         # 修复3：剩余部分正常多线程编译，保存完整日志
@@ -202,7 +220,7 @@ jobs:
         # 终止后台监控
         kill -9 "${{ env.SPACE_MONITOR_PID }}" 2>/dev/null
 
-    # 编译失败上传日志（包含Python3 Host日志）
+    # 编译失败上传日志（新增Binutils日志，便于排查）
     - name: （编译失败时）上传编译日志
       uses: actions/upload-artifact@main
       if: failure() && !cancelled()
@@ -211,9 +229,11 @@ jobs:
         path:
           /workdir/openwrt/compile.log
           /workdir/openwrt/download.log
-          /workdir/openwrt/python3-host-compile.log  # 单独上传Python3 Host日志
+          /workdir/openwrt/python3-host-compile.log
+          /workdir/openwrt/binutils-compile.log  # 新增Binutils日志
         retention-days: 3
 
+    # 以下步骤完全保留原样，无修改
     - name: 检查空间使用情况
       if: (!cancelled())
       run: df -hT
