@@ -78,7 +78,7 @@ jobs:
         sudo apt-get -qq clean
         sudo timedatectl set-timezone "$TZ"
 
-    - name: 克隆源码（增强版校验+兼容版超时）
+    - name: 克隆源码（分支验证+延长超时+详细日志）
       working-directory: /workdir
       run: |
         # 1. 校验/workdir写入权限
@@ -96,41 +96,70 @@ jobs:
           exit 1
         fi
 
-        # 3. 打印克隆参数（便于调试）
+        # 3. 验证目标分支是否存在（避免分支名错误）
+        echo "=== 验证目标分支是否存在 ==="
+        if ! git ls-remote --exit-code --heads $REPO_URL $REPO_BRANCH >/dev/null 2>&1; then
+          echo "Error: 目标分支不存在！仓库：$REPO_URL，分支：$REPO_BRANCH"
+          echo "可用分支列表（前10个）："
+          git ls-remote --heads $REPO_URL | head -10 | awk '{print $2}' | sed 's/refs\/heads\///'
+          exit 1
+        fi
+        echo "目标分支存在，继续克隆..."
+
+        # 4. 打印克隆参数+环境信息（便于调试）
         echo "=== 克隆配置 ==="
         echo "仓库地址: $REPO_URL"
         echo "分支: $REPO_BRANCH"
         echo "目标目录: $PWD/openwrt"
-        echo "Git版本: $(git --version)"  # 打印Git版本，方便调试
+        echo "Git版本: $(git --version)"
+        echo "网络信息: $(ip addr | grep -E 'inet (10\.|172\.1[6-9]\.|172\.2[0-9]\.|172\.3[0-1]\.|192\.168\.)' | head -1)"
 
-        # 4. 清理残留目录（避免冲突）
+        # 5. 清理残留目录（避免冲突）
         rm -rf openwrt
 
-        # 5. 兼容版超时重试（用系统timeout命令，支持所有Git版本）
-        # 逻辑：每次尝试10秒超时，3次重试，超时/失败则重试
+        # 6. 延长超时到30秒+详细日志（3次重试）
+        CLONE_SUCCESS=0
         for i in {1..3}; do
-          echo "=== 第$i次克隆尝试（10秒超时） ==="
-          if timeout 10 git clone $REPO_URL -b $REPO_BRANCH openwrt; then
-            echo "第$i次克隆成功！"
-            break
-          fi
-          # 判断失败原因：超时（124是timeout命令的超时退出码）还是其他错误
+          echo -e "\n=== 第$i次克隆尝试（30秒超时，详细日志） ==="
+          timeout 30 git clone -v $REPO_URL -b $REPO_BRANCH openwrt
           EXIT_CODE=$?
-          if [ $EXIT_CODE -eq 124 ]; then
-            echo "第$i次克隆超时（超过10秒），5秒后重试..."
+
+          # 修正错误码判断：确认目录存在且非空
+          if [ $EXIT_CODE -eq 0 ]; then
+            if [ -d "openwrt" ] && [ "$(ls -A openwrt 2>/dev/null)" ]; then
+              echo "第$i次克隆成功！目录大小：$(du -sh openwrt | awk '{print $1}')"
+              CLONE_SUCCESS=1
+              break
+            else
+              echo "警告：Git返回0，但openwrt目录为空/不存在！"
+              ls -ld openwrt 2>/dev/null
+              rm -rf openwrt
+              EXIT_CODE=1
+            fi
+          elif [ $EXIT_CODE -eq 124 ]; then
+            echo "第$i次克隆超时（超过30秒）"
           else
-            echo "第$i次克隆失败（错误码：$EXIT_CODE），5秒后重试..."
+            echo "第$i次克隆失败（Git错误码：$EXIT_CODE）"
           fi
-          sleep 5
+
+          # 重试间隔
+          if [ $i -lt 3 ]; then
+            echo "5秒后进行第$((i+1))次尝试..."
+            sleep 5
+          fi
         done
 
-        # 6. 校验目录是否存在
-        if [ ! -d "openwrt" ]; then
-          echo "Error: 3次克隆均失败，openwrt目录未创建！"
+        # 7. 最终校验克隆结果
+        if [ $CLONE_SUCCESS -ne 1 ]; then
+          echo -e "\nError: 3次克隆均失败！可能原因："
+          echo "1. 网络不稳定（GitHub Actions网络波动）"
+          echo "2. 仓库分支内容异常（手动访问 $REPO_URL/tree/$REPO_BRANCH 确认）"
+          echo "3. 超时不足（可将30秒改为60秒）"
           exit 1
         fi
 
-        # 7. 校验源码完整性（核心文件存在性）
+        # 8. 校验源码完整性（核心文件存在性）
+        echo -e "\n=== 校验源码完整性 ==="
         KEY_FILES="Makefile scripts/feeds defconfig include"
         for file in $KEY_FILES; do
           if [ ! -e "openwrt/$file" ]; then
@@ -141,7 +170,7 @@ jobs:
         done
         echo "源码完整性验证通过！"
 
-        # 8. 创建符号链接（便于后续步骤访问）
+        # 9. 创建符号链接并验证
         ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
         if [ ! -L "$GITHUB_WORKSPACE/openwrt" ] || [ ! -d "$GITHUB_WORKSPACE/openwrt" ]; then
           echo "Error: 符号链接创建失败！"
@@ -150,7 +179,7 @@ jobs:
         fi
 
         # 克隆完成日志
-        echo "=== 克隆完成 ==="
+        echo -e "\n=== 克隆完成 ==="
         echo "openwrt实际路径: $(realpath openwrt)"
         echo "符号链接路径: $(realpath $GITHUB_WORKSPACE/openwrt)"
         df -hT $PWD/openwrt
