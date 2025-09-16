@@ -278,6 +278,12 @@ jobs:
         run: |
           cd openwrt || { echo "Error: 无法进入openwrt目录！"; exit 1; }
           
+          # 【关键修复】设置共享库路径，解决"找不到动态链接库"问题
+          export LIBDIR="/workdir/openwrt/staging_dir/host/lib"  # 宿主工具链库目录
+          export LD_LIBRARY_PATH="$LIBDIR:$LD_LIBRARY_PATH"    # 执行时加载库路径
+          export LD_RUN_PATH="$LIBDIR:$LD_RUN_PATH"            # 链接时记录库路径
+          echo "已配置共享库路径: LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
+          
           # 1. 适配线程数（按内存优化）
           THREADS=$(( $(nproc) - 1 ))
           [ "$THREADS" -lt 1 ] && THREADS=1
@@ -288,7 +294,7 @@ jobs:
           
           # 2. 前置编译Binutils（工具链核心，避免后续依赖失败）
           echo "=== 单线程编译Binutils ==="
-          make -j1 toolchain/binutils/compile V=s 2>&1 | tee binutils-compile.log
+          make -j1 toolchain/binutils/compile V=s LDFLAGS="-Wl,-rpath,$LIBDIR" 2>&1 | tee binutils-compile.log
           if [ $? -ne 0 ]; then
             echo "Error: Binutils编译失败！"
             cat binutils-compile.log
@@ -299,25 +305,25 @@ jobs:
           echo "=== 单线程编译Python3 Host ==="
           PYTHON_TARGET1="package/feeds/packages/python3/host-compile"
           PYTHON_TARGET2="package/python3/host/compile"
-          if make -j1 $PYTHON_TARGET1 V=s 2>&1 | tee python3-host-compile.log; then
+          if make -j1 $PYTHON_TARGET1 V=s LDFLAGS="-Wl,-rpath,$LIBDIR" 2>&1 | tee python3-host-compile.log; then
             echo "Python3 Host编译成功（路径1: $PYTHON_TARGET1）"
           else
             echo "重试路径2: $PYTHON_TARGET2"
-            if ! make -j1 $PYTHON_TARGET2 V=s 2>&1 | tee -a python3-host-compile.log; then
+            if ! make -j1 $PYTHON_TARGET2 V=s LDFLAGS="-Wl,-rpath,$LIBDIR" 2>&1 | tee -a python3-host-compile.log; then
               echo "Error: Python3 Host编译失败！"
               cat python3-host-compile.log
               exit 1
             fi
           fi
           
-          # 4. 多线程编译主固件（失败后重试单线程+详细日志）
+          # 4. 多线程编译主固件（失败后重试单线程+详细日志，添加链接器标志）
           COMPILE_LOG="compile.log"
           echo "=== 多线程编译主固件 ==="
-          make -j"$THREADS" 2>&1 | tee -a "$COMPILE_LOG" || {
+          make -j"$THREADS" LDFLAGS="-Wl,-rpath,$LIBDIR" 2>&1 | tee -a "$COMPILE_LOG" || {
             echo "主编译失败，重试单线程..."
-            make -j1 2>&1 | tee -a "$COMPILE_LOG" || {
+            make -j1 LDFLAGS="-Wl,-rpath,$LIBDIR" 2>&1 | tee -a "$COMPILE_LOG" || {
               echo "单线程重试失败，打印详细日志..."
-              make -j1 V=s 2>&1 | tee -a "$COMPILE_LOG"
+              make -j1 V=s LDFLAGS="-Wl,-rpath,$LIBDIR" 2>&1 | tee -a "$COMPILE_LOG"
             }
           }
           
