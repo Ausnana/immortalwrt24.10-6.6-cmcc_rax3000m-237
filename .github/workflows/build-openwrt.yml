@@ -1,469 +1,105 @@
-#
-# Copyright (c) 2019-2020 P3TERX <https://p3terx.com>
-#
-# This is free software, licensed under the MIT License.
-# See /LICENSE for more information.
-#
-# https://github.com/P3TERX/Actions-OpenWrt
-# Description: Build OpenWrt using GitHub Actions
-#
+- name: 克隆源码（分支验证+延长超时+详细日志）
+  working-directory: /workdir
+  run: |
+    # 1. 校验/workdir写入权限
+    if [ ! -w "$PWD" ]; then
+      echo "Error: /workdir目录无写入权限！当前权限：$(ls -ld $PWD)"
+      exit 1
+    fi
 
-name: 构建OpenWrt固件
+    # 2. 校验磁盘空间（至少20GB）
+    WORKDIR_FREE=$(df -m $PWD | awk 'NR==2 {print $4}')
+    REQUIRED_FREE=20480
+    if [ "$WORKDIR_FREE" -lt "$REQUIRED_FREE" ]; then
+      echo "Error: /workdir空间不足！剩余：${WORKDIR_FREE}MB，需至少：${REQUIRED_FREE}MB"
+      df -hT $PWD
+      exit 1
+    fi
 
-permissions:
-  contents: write
-  actions: write
+    # 3. 验证目标分支是否存在（避免分支名错误）
+    echo "=== 验证目标分支是否存在 ==="
+    if ! git ls-remote --exit-code --heads $REPO_URL $REPO_BRANCH >/dev/null 2>&1; then
+      echo "Error: 目标分支不存在！仓库：$REPO_URL，分支：$REPO_BRANCH"
+      echo "可用分支列表（前10个）："
+      git ls-remote --heads $REPO_URL | head -10 | awk '{print $2}' | sed 's/refs\/heads\///'
+      exit 1
+    fi
+    echo "目标分支存在，继续克隆..."
 
-on:
-  repository_dispatch:
-  workflow_dispatch:
-    inputs:
-      ssh:
-        description: 'SSH connection to Actions'
-        required: false
-        default: 'false'
+    # 4. 打印克隆参数+环境信息（便于调试）
+    echo "=== 克隆配置 ==="
+    echo "仓库地址: $REPO_URL"
+    echo "分支: $REPO_BRANCH"
+    echo "目标目录: $PWD/openwrt"
+    echo "Git版本: $(git --version)"
+    echo "网络信息: $(ip addr | grep -E 'inet (10\.|172\.1[6-9]\.|172\.2[0-9]\.|172\.3[0-1]\.|192\.168\.)' | head -1)"
 
-env:
-  REPO_URL: https://github.com/padavanonly/immortalwrt-mt798x-6.6
-  REPO_BRANCH: openwrt-24.10-6.6
-  FEEDS_CONF: feeds.conf.default
-  CONFIG_FILE: .config
-  DIY_P1_SH: diy-part1.sh
-  DIY_P2_SH: diy-part2.sh
-  UPLOAD_BIN_DIR: false
-  UPLOAD_FIRMWARE: true
-  UPLOAD_COWTRANSFER: false
-  UPLOAD_WETRANSFER: false
-  UPLOAD_RELEASE: true
-  TZ: Asia/Shanghai
+    # 5. 清理残留目录（避免冲突）
+    rm -rf openwrt
 
-jobs:
-  build:
-    runs-on: ubuntu-22.04
+    # 6. 延长超时到60秒+浅克隆+详细日志（3次重试）【仅此处修改：30→60，加--depth 1】
+    CLONE_SUCCESS=0
+    for i in {1..3}; do
+      echo -e "\n=== 第$i次克隆尝试（60秒超时，详细日志） ==="
+      timeout 60 git clone -v --depth 1 $REPO_URL -b $REPO_BRANCH openwrt  # 核心修改点
+      EXIT_CODE=$?
 
-    steps:
-    - name: 检出代码
-      uses: actions/checkout@main
-
-    - name: 初始化环境（补充依赖+空间优化）
-      env:
-        DEBIAN_FRONTEND: noninteractive
-      run: |
-        # 深度清理冗余软件，释放空间
-        sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc
-        sudo apt-get purge -y snapd firefox libreoffice* thunderbird
-        sudo rm -rf /var/cache/apt/archives/* /var/tmp/* /tmp/*
-        
-        # 安装必要依赖（含geoview、Python3 Host编译依赖）
-        sudo -E apt-get -qq update
-        sudo -E apt-get -qq install \
-          libcurl4-openssl-dev libjson-c-dev zlib1g-dev \
-          python3 python3-dev python3-distutils python3-pip python3-ply python3-docutils \
-          python3-pyelftools python3-setuptools \
-          $(curl -fsSL git.io/depends-ubuntu-2004)
-        
-        # 重定向临时目录到/workdir（解决/tmp空间不足）
-        sudo mkdir -p /workdir/tmp && sudo chmod 1777 /workdir/tmp
-        export TMPDIR=/workdir/tmp && echo "TMPDIR=/workdir/tmp" >> $GITHUB_ENV
-        
-        # 授权/workdir（避免后续克隆权限问题）
-        sudo mkdir -p /workdir
-        sudo chown -R $USER:$GROUPS /workdir
-        sudo chmod 755 /workdir
-        
-        # 检查初始化后空间
-        echo "=== 初始化后磁盘空间 ==="
-        df -hT / /tmp /workdir
-        sudo apt-get -qq autoremove --purge
-        sudo apt-get -qq clean
-        sudo timedatectl set-timezone "$TZ"
-
-    - name: 克隆源码（分支验证+延长超时+详细日志）
-      working-directory: /workdir
-      run: |
-        # 1. 校验/workdir写入权限
-        if [ ! -w "$PWD" ]; then
-          echo "Error: /workdir目录无写入权限！当前权限：$(ls -ld $PWD)"
-          exit 1
-        fi
-
-        # 2. 校验磁盘空间（至少20GB）
-        WORKDIR_FREE=$(df -m $PWD | awk 'NR==2 {print $4}')
-        REQUIRED_FREE=20480
-        if [ "$WORKDIR_FREE" -lt "$REQUIRED_FREE" ]; then
-          echo "Error: /workdir空间不足！剩余：${WORKDIR_FREE}MB，需至少：${REQUIRED_FREE}MB"
-          df -hT $PWD
-          exit 1
-        fi
-
-        # 3. 验证目标分支是否存在（避免分支名错误）
-        echo "=== 验证目标分支是否存在 ==="
-        if ! git ls-remote --exit-code --heads $REPO_URL $REPO_BRANCH >/dev/null 2>&1; then
-          echo "Error: 目标分支不存在！仓库：$REPO_URL，分支：$REPO_BRANCH"
-          echo "可用分支列表（前10个）："
-          git ls-remote --heads $REPO_URL | head -10 | awk '{print $2}' | sed 's/refs\/heads\///'
-          exit 1
-        fi
-        echo "目标分支存在，继续克隆..."
-
-        # 4. 打印克隆参数+环境信息（便于调试）
-        echo "=== 克隆配置 ==="
-        echo "仓库地址: $REPO_URL"
-        echo "分支: $REPO_BRANCH"
-        echo "目标目录: $PWD/openwrt"
-        echo "Git版本: $(git --version)"
-        echo "网络信息: $(ip addr | grep -E 'inet (10\.|172\.1[6-9]\.|172\.2[0-9]\.|172\.3[0-1]\.|192\.168\.)' | head -1)"
-
-        # 5. 清理残留目录（避免冲突）
-        rm -rf openwrt
-
-        # 6. 延长超时到30秒+详细日志（3次重试）
-        CLONE_SUCCESS=0
-        for i in {1..3}; do
-          echo -e "\n=== 第$i次克隆尝试（30秒超时，详细日志） ==="
-          timeout 30 git clone -v $REPO_URL -b $REPO_BRANCH openwrt
-          EXIT_CODE=$?
-
-          # 修正错误码判断：确认目录存在且非空
-          if [ $EXIT_CODE -eq 0 ]; then
-            if [ -d "openwrt" ] && [ "$(ls -A openwrt 2>/dev/null)" ]; then
-              echo "第$i次克隆成功！目录大小：$(du -sh openwrt | awk '{print $1}')"
-              CLONE_SUCCESS=1
-              break
-            else
-              echo "警告：Git返回0，但openwrt目录为空/不存在！"
-              ls -ld openwrt 2>/dev/null
-              rm -rf openwrt
-              EXIT_CODE=1
-            fi
-          elif [ $EXIT_CODE -eq 124 ]; then
-            echo "第$i次克隆超时（超过30秒）"
-          else
-            echo "第$i次克隆失败（Git错误码：$EXIT_CODE）"
-          fi
-
-          # 重试间隔
-          if [ $i -lt 3 ]; then
-            echo "5秒后进行第$((i+1))次尝试..."
-            sleep 5
-          fi
-        done
-
-        # 7. 最终校验克隆结果
-        if [ $CLONE_SUCCESS -ne 1 ]; then
-          echo -e "\nError: 3次克隆均失败！可能原因："
-          echo "1. 网络不稳定（GitHub Actions网络波动）"
-          echo "2. 仓库分支内容异常（手动访问 $REPO_URL/tree/$REPO_BRANCH 确认）"
-          echo "3. 超时不足（可将30秒改为60秒）"
-          exit 1
-        fi
-
-        # 8. 校验源码完整性（核心文件存在性）
-        echo -e "\n=== 校验源码完整性 ==="
-        KEY_FILES="Makefile scripts/feeds defconfig include"
-        for file in $KEY_FILES; do
-          if [ ! -e "openwrt/$file" ]; then
-            echo "Error: 源码不完整！缺失关键文件：openwrt/$file"
-            ls -l openwrt/
-            exit 1
-          fi
-        done
-        echo "源码完整性验证通过！"
-
-        # 9. 创建符号链接并验证
-        ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
-        if [ ! -L "$GITHUB_WORKSPACE/openwrt" ] || [ ! -d "$GITHUB_WORKSPACE/openwrt" ]; then
-          echo "Error: 符号链接创建失败！"
-          echo "链接状态: $(ls -l $GITHUB_WORKSPACE/openwrt 2>/dev/null)"
-          exit 1
-        fi
-
-        # 克隆完成日志
-        echo -e "\n=== 克隆完成 ==="
-        echo "openwrt实际路径: $(realpath openwrt)"
-        echo "符号链接路径: $(realpath $GITHUB_WORKSPACE/openwrt)"
-        df -hT $PWD/openwrt
-
-    - name: 缓存工具链（排除Python3避免冲突）
-      uses: actions/cache@v3
-      with:
-        path: |
-          /workdir/openwrt/staging_dir/toolchain-*
-          /workdir/openwrt/staging_dir/target-*/usr/lib
-          !/workdir/openwrt/staging_dir/hostpkg/*python3*
-        key: ${{ runner.os }}-openwrt-cache-${{ env.REPO_BRANCH }}-${{ hashFiles('.config', 'diy-*.sh') }}
-        restore-keys: |
-          ${{ runner.os }}-openwrt-cache-${{ env.REPO_BRANCH }}-
-          ${{ runner.os }}-openwrt-cache-
-
-    - name: 加载自定义Feeds（目录校验）
-      run: |
-        cd openwrt || { echo "Error: 无法进入openwrt目录！"; exit 1; }
-        [ -e "$GITHUB_WORKSPACE/$FEEDS_CONF" ] && mv "$GITHUB_WORKSPACE/$FEEDS_CONF" feeds.conf.default
-        chmod +x "$GITHUB_WORKSPACE/$DIY_P1_SH"
-        "$GITHUB_WORKSPACE/$DIY_P1_SH"
-
-    - name: 更新Feeds
-      run: |
-        cd openwrt || { echo "Error: 无法进入openwrt目录！"; exit 1; }
-        ./scripts/feeds update -a 2>&1 | tee feeds-update.log
-
-    - name: 安装Feeds（补充Python3）
-      run: |
-        cd openwrt || { echo "Error: 无法进入openwrt目录！"; exit 1; }
-        # 合并安装：先安装所有Feeds，再单独确认Python3
-        ./scripts/feeds install -a && ./scripts/feeds install python3
-        echo "Feeds安装完成，已确认Python3包存在"
-
-    - name: 加载自定义配置
-      run: |
-        cd openwrt || { echo "Error: 无法进入openwrt目录！"; exit 1; }
-        [ -d "$GITHUB_WORKSPACE/files" ] && mv "$GITHUB_WORKSPACE/files" files
-        [ -e "$GITHUB_WORKSPACE/$CONFIG_FILE" ] && mv "$GITHUB_WORKSPACE/$CONFIG_FILE" .config
-        chmod +x "$GITHUB_WORKSPACE/$DIY_P2_SH"
-        "$GITHUB_WORKSPACE/$DIY_P2_SH"
-
-    - name: SSH连接（调试用）
-      uses: P3TERX/ssh2actions@v1.0.0
-      if: fromJSON(github.event.inputs.ssh || 'false') || contains(github.event.action, 'ssh')
-      env:
-        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-
-    - name: 下载软件包（校验完整性）
-      id: package
-      run: |
-        cd openwrt || { echo "Error: 无法进入openwrt目录！"; exit 1; }
-        make defconfig
-        make download -j8 2>&1 | tee download.log
-        
-        # 清理空包（避免编译失败）
-        find dl -size -1024c -exec ls -l {} \;
-        find dl -size -1024c -exec rm -f {} \;
-        
-        # 校验下载结果
-        if ! ls dl/* 2>/dev/null; then
-          echo "Error: 未下载到任何软件包！"
-          cat download.log
-          exit 1
-        fi
-        echo "软件包下载完成，共$(ls dl/ | wc -l)个文件"
-
-    - name: 编译前空间检查
-      id: space_check
-      run: |
-        ROOT_FREE=$(df -m / | awk 'NR==2 {print $4}')
-        REQUIRED_FREE=15360  # 至少15GB剩余空间
-        echo "=== 编译前空间 ==="
-        echo "根分区剩余: ${ROOT_FREE}MB（需求: ${REQUIRED_FREE}MB）"
-        
-        # 空间不足时清理dl目录
-        if [ "$ROOT_FREE" -lt "$REQUIRED_FREE" ]; then
-          echo "Warning: 空间不足，清理dl目录..."
-          sudo rm -rf /workdir/openwrt/dl/* 2>/dev/null
-          ROOT_FREE_AFTER=$(df -m / | awk 'NR==2 {print $4}')
-          echo "清理后剩余: ${ROOT_FREE_AFTER}MB"
-          [ "$ROOT_FREE_AFTER" -lt "$REQUIRED_FREE" ] && { echo "Error: 清理后空间仍不足！"; exit 1; }
-        fi
-        
-        # 后台空间监控（每30秒检查一次）
-        echo "启动后台空间监控..."
-        while true; do
-          ROOT_FREE=$(df -m / | awk 'NR==2 {print $4}')
-          [ "$ROOT_FREE" -lt 10240 ] && { echo "Low space! 清理dl目录..."; sudo rm -rf /workdir/openwrt/dl/* 2>/dev/null; }
-          sleep 30
-        done &
-        echo "SPACE_MONITOR_PID=$!" >> $GITHUB_ENV
-
-    - name: 编译固件（核心修复）
-      id: compile
-      run: |
-        cd openwrt || { echo "Error: 无法进入openwrt目录！"; exit 1; }
-        
-        # 1. 适配线程数（按内存优化）
-        THREADS=$(( $(nproc) - 1 ))
-        [ "$THREADS" -lt 1 ] && THREADS=1
-        MEM_TOTAL=$(free -m | awk '/Mem:/ {print $2}')
-        [ "$MEM_TOTAL" -lt 8192 ] && THREADS=1
-        echo "=== 编译配置 ==="
-        echo "线程数: ${THREADS}（内存: ${MEM_TOTAL}MB）"
-        
-        # 2. 前置编译Binutils（工具链核心，避免后续依赖失败）
-        echo "=== 单线程编译Binutils ==="
-        make -j1 toolchain/binutils/compile V=s 2>&1 | tee binutils-compile.log
-        if [ $? -ne 0 ]; then
-          echo "Error: Binutils编译失败！"
-          cat binutils-compile.log
-          exit 1
-        fi
-        
-        # 3. 单线程编译Python3 Host（兼容路径，避免多线程冲突）
-        echo "=== 单线程编译Python3 Host ==="
-        PYTHON_TARGET1="package/feeds/packages/python3/host-compile"
-        PYTHON_TARGET2="package/python3/host/compile"
-        if make -j1 $PYTHON_TARGET1 V=s 2>&1 | tee python3-host-compile.log; then
-          echo "Python3 Host编译成功（路径1: $PYTHON_TARGET1）"
+      # 修正错误码判断：确认目录存在且非空
+      if [ $EXIT_CODE -eq 0 ]; then
+        if [ -d "openwrt" ] && [ "$(ls -A openwrt 2>/dev/null)" ]; then
+          echo "第$i次克隆成功！目录大小：$(du -sh openwrt | awk '{print $1}')"
+          CLONE_SUCCESS=1
+          break
         else
-          echo "重试路径2: $PYTHON_TARGET2"
-          if ! make -j1 $PYTHON_TARGET2 V=s 2>&1 | tee -a python3-host-compile.log; then
-            echo "Error: Python3 Host编译失败！"
-            cat python3-host-compile.log
-            exit 1
-          fi
+          echo "警告：Git返回0，但openwrt目录为空/不存在！"
+          ls -ld openwrt 2>/dev/null
+          rm -rf openwrt
+          EXIT_CODE=1
         fi
-        
-        # 4. 多线程编译主固件（失败后重试单线程+详细日志）
-        COMPILE_LOG="compile.log"
-        echo "=== 多线程编译主固件 ==="
-        make -j"$THREADS" 2>&1 | tee -a "$COMPILE_LOG" || {
-          echo "主编译失败，重试单线程..."
-          make -j1 2>&1 | tee -a "$COMPILE_LOG" || {
-            echo "单线程重试失败，打印详细日志..."
-            make -j1 V=s 2>&1 | tee -a "$COMPILE_LOG"
-          }
-        }
-        
-        # 5. 编译结果校验
-        if [ $? -ne 0 ]; then
-          echo "=== 编译失败后空间 ==="
-          df -hT /
-          cat "$COMPILE_LOG" | tail -100  # 打印最后100行日志
-          exit 1
-        fi
-        
-        # 6. 提取设备信息
-        DEVICE=$(grep -m1 '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/')
-        [ -n "$DEVICE" ] && echo "DEVICE_NAME=_${DEVICE}" >> $GITHUB_ENV || echo "DEVICE_NAME=_unknown" >> $GITHUB_ENV
-        echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
-        echo "status=success" >> $GITHUB_OUTPUT
-        
-        # 7. 终止后台监控
-        kill -9 "${{ env.SPACE_MONITOR_PID }}" 2>/dev/null
-        echo "编译成功！设备名: ${DEVICE_NAME}, 时间戳: ${FILE_DATE}"
+      elif [ $EXIT_CODE -eq 124 ]; then
+        echo "第$i次克隆超时（超过60秒）"
+      else
+        echo "第$i次克隆失败（Git错误码：$EXIT_CODE）"
+      fi
 
-    - name: 编译失败上传日志
-      uses: actions/upload-artifact@main
-      if: failure() && !cancelled()
-      with:
-        name: compile-log-${{ env.FILE_DATE }}
-        path:
-          /workdir/openwrt/compile.log
-          /workdir/openwrt/download.log
-          /workdir/openwrt/python3-host-compile.log
-          /workdir/openwrt/binutils-compile.log
-          /workdir/openwrt/feeds-update.log
-        retention-days: 3
+      # 重试间隔（保持不变）
+      if [ $i -lt 3 ]; then
+        echo "5秒后进行第$((i+1))次尝试..."
+        sleep 5
+      fi
+    done
 
-    - name: 检查编译后空间
-      if: (!cancelled())
-      run: |
-        echo "=== 编译后磁盘空间 ==="
-        df -hT / /workdir
+    # 7. 最终校验克隆结果（保持不变）
+    if [ $CLONE_SUCCESS -ne 1 ]; then
+      echo -e "\nError: 3次克隆均失败！可能原因："
+      echo "1. 网络不稳定（GitHub Actions网络波动）"
+      echo "2. 仓库分支内容异常（手动访问 $REPO_URL/tree/$REPO_BRANCH 确认）"
+      echo "3. 超时不足（可将60秒改为90秒）"  # 注释同步更新
+      exit 1
+    fi
 
-    - name: 上传bin目录（可选）
-      uses: actions/upload-artifact@main
-      if: steps.compile.outputs.status == 'success' && env.UPLOAD_BIN_DIR == 'true'
-      with:
-        name: OpenWrt_bin${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
-        path: /workdir/openwrt/bin
-        retention-days: 3
+    # 8. 校验源码完整性（核心文件存在性）（保持不变）
+    echo -e "\n=== 校验源码完整性 ==="
+    KEY_FILES="Makefile scripts/feeds defconfig include"
+    for file in $KEY_FILES; do
+      if [ ! -e "openwrt/$file" ]; then
+        echo "Error: 源码不完整！缺失关键文件：openwrt/$file"
+        ls -l openwrt/
+        exit 1
+      fi
+    done
+    echo "源码完整性验证通过！"
 
-    - name: 整理固件文件
-      id: organize
-      if: env.UPLOAD_FIRMWARE == 'true' && !cancelled()
-      run: |
-        # MT798x属于mediatek/filogic架构，固件目录固定
-        FIRMWARE_DIR="/workdir/openwrt/bin/targets/mediatek/filogic"
-        cd $FIRMWARE_DIR || { echo "Error: 固件目录不存在！"; exit 1; }
-        
-        echo "=== 整理前固件目录 ==="
-        ls -lha
-        
-        # 清理无用文件（保留实际固件）
-        rm -rf packages *.buildinfo *.manifest *.json *.md5sum *.sha256sum */debug 2>/dev/null
-        
-        # 校验整理结果
-        if [ -z "$(ls -A . 2>/dev/null)" ]; then
-          echo "Error: 整理后无固件文件！"
-          ls -lha
-          exit 1
-        fi
-        
-        echo "=== 整理后固件目录 ==="
-        ls -lha
-        echo "FIRMWARE=$FIRMWARE_DIR" >> $GITHUB_ENV
-        echo "status=success" >> $GITHUB_OUTPUT
-        echo "共生成$(ls -1 | wc -l)个固件文件"
+    # 9. 创建符号链接并验证（保持不变）
+    ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
+    if [ ! -L "$GITHUB_WORKSPACE/openwrt" ] || [ ! -d "$GITHUB_WORKSPACE/openwrt" ]; then
+      echo "Error: 符号链接创建失败！"
+      echo "链接状态: $(ls -l $GITHUB_WORKSPACE/openwrt 2>/dev/null)"
+      exit 1
+    fi
 
-    - name: 上传固件目录
-      uses: actions/upload-artifact@main
-      if: steps.organize.outputs.status == 'success' && !cancelled()
-      with:
-        name: OpenWrt_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
-        path: ${{ env.FIRMWARE }}/*
-        retention-days: 3
-
-    - name: 上传固件到奶牛快传（可选）
-      id: cowtransfer
-      if: steps.organize.outputs.status == 'success' && env.UPLOAD_COWTRANSFER == 'true' && !cancelled()
-      run: |
-        curl -fsSL git.io/file-transfer | sh
-        ./transfer cow --block 2621440 -s -p 64 --no-progress "${FIRMWARE}/*" 2>&1 | tee cowtransfer.log
-        echo "::warning file=cowtransfer.com::$(cat cowtransfer.log | grep https)"
-        echo "url=$(cat cowtransfer.log | grep https | cut -f3 -d" ")" >> $GITHUB_OUTPUT
-
-    - name: 上传固件到WeTransfer（可选）
-      id: wetransfer
-      if: steps.organize.outputs.status == 'success' && env.UPLOAD_WETRANSFER == 'true' && !cancelled()
-      run: |
-        curl -fsSL git.io/file-transfer | sh
-        ./transfer wet -s -p 16 --no-progress "${FIRMWARE}/*" 2>&1 | tee wetransfer.log
-        echo "::warning file=wetransfer.com::$(cat wetransfer.log | grep https)"
-        echo "url=$(cat wetransfer.log | grep https | cut -f3 -d" ")" >> $GITHUB_OUTPUT
-
-    - name: 生成发布标签与说明
-      id: tag
-      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
-      run: |
-        COMMIT_HASH=$(echo ${{ github.sha }} | cut -c1-8)
-        release_tag=$(date +"%Y.%m.%d-%H%M-immortalwrt24.10-6.6${{ env.DEVICE_NAME }}-$COMMIT_HASH")
-        
-        # 用Bash语法去掉DEVICE_NAME开头的下划线（避开YAML解析冲突）
-        CLEAN_DEVICE_NAME="${{ env.DEVICE_NAME }}"
-        CLEAN_DEVICE_NAME="${CLEAN_DEVICE_NAME#_}"
-        
-        # 生成发布说明
-        touch release.txt
-        echo "### ImmortalWrt 固件发布（${CLEAN_DEVICE_NAME}）" >> release.txt
-        echo "- 后台地址：http://192.168.6.1 或 http://immortalwrt.lan" >> release.txt
-        echo "- 登录账号：root" >> release.txt
-        echo "- 登录密码：无（首次登录需设置）" >> release.txt
-        echo "- 默认主题：Argon" >> release.txt
-        echo "- 集成插件：aria2、openlist2、diskman、lucky、ksmb、hd-idle、autoreboot、mtwifi-cfg" >> release.txt
-        echo "- 编译源码：${{ env.REPO_URL }}（分支：${{ env.REPO_BRANCH }}）" >> release.txt
-        echo "- 编译Commit：${{ github.sha }}（前8位：${COMMIT_HASH}）" >> release.txt
-        echo "- 编译时间：$(date +"%Y-%m-%d %H:%M:%S %Z")" >> release.txt
-        echo "- 固件文件列表：" >> release.txt
-        ls -1 "${FIRMWARE}"/* | xargs -n1 basename | sed 's/^/- /' >> release.txt
-        
-        echo "release_tag=${release_tag}" >> $GITHUB_OUTPUT
-        echo "status=success" >> $GITHUB_OUTPUT
-
-    - name: 上传固件到发布页
-      uses: softprops/action-gh-release@v1
-      if: steps.tag.outputs.status == 'success' && !cancelled()
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        tag_name: ${{ steps.tag.outputs.release_tag }}
-        body_path: release.txt
-        files: ${{ env.FIRMWARE }}/*
-        draft: false
-        prerelease: false
-      timeout-minutes: 5
-
-    - name: 删除旧工作流记录（保留最近3条）
-      uses: GitRML/delete-workflow-runs@main
-      with:
-        retain_days: 1
-        keep_minimum_runs: 3
+    # 克隆完成日志（保持不变）
+    echo -e "\n=== 克隆完成 ==="
+    echo "openwrt实际路径: $(realpath openwrt)"
+    echo "符号链接路径: $(realpath $GITHUB_WORKSPACE/openwrt)"
+    df -hT $PWD/openwrt
