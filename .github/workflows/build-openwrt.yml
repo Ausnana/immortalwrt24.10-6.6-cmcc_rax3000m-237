@@ -1,4 +1,4 @@
-- name: 克隆源码（分支验证+延长超时+详细日志）
+name: 克隆源码（分支验证+延长超时+详细日志）
   working-directory: /workdir
   run: |
     # 1. 校验/workdir写入权限
