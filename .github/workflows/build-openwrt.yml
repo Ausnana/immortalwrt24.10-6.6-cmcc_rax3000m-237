@@ -1,22 +1,35 @@
-name: 构建OpenWrt固件 - CMCC RAX3000M NAND版
+#
+# Copyright (c) 2019-2020 P3TERX <https://p3terx.com>
+#
+# This is free software, licensed under the MIT License.
+# See /LICENSE for more information.
+#
+# https://github.com/P3TERX/Actions-OpenWrt
+# Description: Build OpenWrt using GitHub Actions
+#
+
+name: Build OpenWrt
 
 on:
+  repository_dispatch:
   workflow_dispatch:
     inputs:
       ssh:
-        description: 'SSH连接（调试用）'
+        description: 'SSH connection to Actions'
         required: false
         default: 'false'
-  repository_dispatch:
-    types: [build-nand-firmware]
 
 env:
   REPO_URL: https://github.com/padavanonly/immortalwrt-mt798x-6.6
   REPO_BRANCH: openwrt-24.10-6.6
+  FEEDS_CONF: feeds.conf.default
   CONFIG_FILE: .config
   DIY_P1_SH: diy-part1.sh
   DIY_P2_SH: diy-part2.sh
+  UPLOAD_BIN_DIR: false
   UPLOAD_FIRMWARE: true
+  UPLOAD_COWTRANSFER: false
+  UPLOAD_WETRANSFER: false
   UPLOAD_RELEASE: true
   TZ: Asia/Shanghai
 
@@ -25,203 +38,154 @@ jobs:
     runs-on: ubuntu-22.04
 
     steps:
-      - name: 检出代码
-        uses: actions/checkout@v4
+    - name: Checkout
+      uses: actions/checkout@main
 
-      - name: 初始化环境（补充依赖+空间优化）
-        env:
-          DEBIAN_FRONTEND: noninteractive
-        run: |
-          sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc
-          sudo apt-get purge -y snapd firefox libreoffice* thunderbird
-          sudo rm -rf /var/cache/apt/archives/* /var/tmp/* /tmp/*
-          sudo -E apt-get -qq update
-          sudo -E apt-get -qq install \
-            libcurl4-openssl-dev libjson-c-dev zlib1g-dev \
-            python3 python3-dev python3-distutils python3-pip python3-ply python3-docutils \
-            python3-pyelftools python3-setuptools \
-            $(curl -fsSL git.io/depends-ubuntu-2004)
-          sudo mkdir -p /workdir/tmp && sudo chmod 1777 /workdir/tmp
-          export TMPDIR=/workdir/tmp && echo "TMPDIR=/workdir/tmp" >> $GITHUB_ENV
-          sudo mkdir -p /workdir && sudo chown -R $USER:$GROUPS /workdir && sudo chmod 755 /workdir
-          df -hT / /tmp /workdir
-          sudo apt-get -qq autoremove --purge && sudo apt-get -qq clean
-          sudo timedatectl set-timezone "$TZ"
+    - name: Initialization environment
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc
+        sudo -E apt-get -qq update
+        sudo -E apt-get -qq install $(curl -fsSL git.io/depends-ubuntu-2004)
+        sudo -E apt-get -qq autoremove --purge
+        sudo -E apt-get -qq clean
+        sudo timedatectl set-timezone "$TZ"
+        sudo mkdir -p /workdir
+        sudo chown $USER:$GROUPS /workdir
 
-      - name: 克隆源码（分支验证+无超时+详细日志）
-        working-directory: /workdir
-        run: |
-          if [ ! -w "$PWD" ]; then echo "Error: /workdir目录无写入权限！"; exit 1; fi
-          WORKDIR_FREE=$(df -m $PWD | awk 'NR==2 {print $4}')
-          REQUIRED_FREE=20480
-          if [ "$WORKDIR_FREE" -lt "$REQUIRED_FREE" ]; then echo "Error: /workdir空间不足！"; exit 1; fi
-          if ! git ls-remote --exit-code --heads $REPO_URL $REPO_BRANCH >/dev/null 2>&1; then
-            echo "Error: 目标分支不存在！仓库：$REPO_URL，分支：$REPO_BRANCH"; exit 1
-          fi
-          git clone -v $REPO_URL -b $REPO_BRANCH openwrt
-          if [ $? -ne 0 ]; then echo "克隆失败！"; exit 1; fi
-          ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
-          cd openwrt && git log -1 --oneline
+    - name: Clone source code
+      working-directory: /workdir
+      run: |
+        df -hT $PWD
+        git clone $REPO_URL -b $REPO_BRANCH openwrt
+        ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
 
-      - name: 缓存工具链（排除Python3避免冲突）
-        uses: actions/cache@v3
-        with:
-          path: |
-            /workdir/openwrt/staging_dir/toolchain-*
-            /workdir/openwrt/staging_dir/target-*/usr/lib
-            !/workdir/openwrt/staging_dir/hostpkg/*python3*
-          key: ${{ runner.os }}-openwrt-cache-${{ env.REPO_BRANCH }}-${{ hashFiles('.config', 'diy-*.sh') }}
-          restore-keys: |
-            ${{ runner.os }}-openwrt-cache-${{ env.REPO_BRANCH }}-
-            ${{ runner.os }}-openwrt-cache-
+    - name: Load custom feeds
+      run: |
+        [ -e $FEEDS_CONF ] && mv $FEEDS_CONF openwrt/feeds.conf.default
+        chmod +x $DIY_P1_SH
+        cd openwrt
+        $GITHUB_WORKSPACE/$DIY_P1_SH
 
-      - name: 加载自定义Feeds
-        run: |
-          cd openwrt || exit 1
-          [ -e "$GITHUB_WORKSPACE/$FEEDS_CONF" ] && mv "$GITHUB_WORKSPACE/$FEEDS_CONF" feeds.conf.default
-          chmod +x "$GITHUB_WORKSPACE/$DIY_P1_SH"
-          "$GITHUB_WORKSPACE/$DIY_P1_SH"
+    - name: Update feeds
+      run: cd openwrt && ./scripts/feeds update -a
 
-      - name: 更新Feeds
-        run: |
-          cd openwrt || exit 1
-          ./scripts/feeds update -a 2>&1 | tee feeds-update.log
+    - name: Install feeds
+      run: cd openwrt && ./scripts/feeds install -a
 
-      - name: 安装Feeds（补充Python3）
-        run: |
-          cd openwrt || exit 1
-          ./scripts/feeds install -a && ./scripts/feeds install python3
+    - name: Load custom configuration
+      run: |
+        [ -e files ] && mv files openwrt/files
+        [ -e $CONFIG_FILE ] && mv $CONFIG_FILE openwrt/.config
+        chmod +x $DIY_P2_SH
+        cd openwrt
+        $GITHUB_WORKSPACE/$DIY_P2_SH
 
-      - name: 强制写入NAND配置（关键修改）
-        run: |
-          cd openwrt || exit 1
-          echo 'CONFIG_TARGET_mediatek_mt7981_nand=y' > .config
-          echo 'CONFIG_TARGET_mediatek_generic=y' >> .config
-          echo 'CONFIG_PACKAGE_kmod-mt7981=y' >> .config
-          echo 'CONFIG_MTD_NAND=y' >> .config
-          echo 'CONFIG_MTD_NAND_MTK=y' >> .config
-          [ -e "$GITHUB_WORKSPACE/.config" ] && cat "$GITHUB_WORKSPACE/.config" >> .config
-          chmod +x "$GITHUB_WORKSPACE/$DIY_P2_SH"
-          "$GITHUB_WORKSPACE/$DIY_P2_SH"
-          make defconfig
+    - name: SSH connection to Actions
+      uses: P3TERX/ssh2actions@v1.0.0
+      if: (github.event.inputs.ssh == 'true' && github.event.inputs.ssh  != 'false') || contains(github.event.action, 'ssh')
+      env:
+        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
 
-      - name: SSH连接（调试用）
-        uses: P3TERX/ssh2actions@v1.0.0
-        if: fromJSON(github.event.inputs.ssh || 'false') || contains(github.event.action, 'ssh')
-        env:
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+    - name: Download package
+      id: package
+      run: |
+        cd openwrt
+        make defconfig
+        make download -j8
+        find dl -size -1024c -exec ls -l {} \;
+        find dl -size -1024c -exec rm -f {} \;
 
-      - name: 下载软件包（校验完整性）
-        run: |
-          cd openwrt || exit 1
-          make defconfig
-          make download -j8 2>&1 | tee download.log
-          find dl -size -1024c -exec rm -f {} \;
-          if ! ls dl/* 2>/dev/null; then echo "Error: 未下载到任何软件包！"; exit 1; fi
+    - name: Compile the firmware
+      id: compile
+      run: |
+        cd openwrt
+        echo -e "$(nproc) thread compile"
+        make -j$(nproc) || make -j1 || make -j1 V=s
+        echo "status=success" >> $GITHUB_OUTPUT
+        grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME
+        [ -s DEVICE_NAME ] && echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> $GITHUB_ENV
+        echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
 
-      - name: 编译前空间检查
-        run: |
-          ROOT_FREE=$(df -m / | awk 'NR==2 {print $4}')
-          REQUIRED_FREE=20480
-          echo "根分区剩余: ${ROOT_FREE}MB（需求: ${REQUIRED_FREE}MB）"
-          if [ "$ROOT_FREE" -lt "$REQUIRED_FREE" ]; then
-            echo "清理dl目录..."
-            sudo rm -rf /workdir/openwrt/dl/* 2>/dev/null
-          fi
-          while true; do
-            ROOT_FREE=$(df -m / | awk 'NR==2 {print $4}')
-            [ "$ROOT_FREE" -lt 10240 ] && sudo rm -rf /workdir/openwrt/dl/* 2>/dev/null
-            sleep 30
-          done &
-          echo "SPACE_MONITOR_PID=$!" >> $GITHUB_ENV
+    - name: Check space usage
+      if: (!cancelled())
+      run: df -hT
 
-      - name: 编译固件（NAND优化）
-        run: |
-          cd openwrt || exit 1
-          export LIBDIR="/workdir/openwrt/staging_dir/host/lib"
-          export LD_LIBRARY_PATH="$LIBDIR:$LD_LIBRARY_PATH"
-          export LD_RUN_PATH="$LIBDIR:$LD_RUN_PATH"
-          THREADS=$(( $(nproc) - 1 ))
-          MEM_TOTAL=$(free -m | awk '/Mem:/ {print $2}')
-          [ "$MEM_TOTAL" -lt 8192 ] && THREADS=1
-          echo "线程数: ${THREADS}（内存: ${MEM_TOTAL}MB）"
-          make -j1 toolchain/binutils/compile V=s LDFLAGS="-Wl,-rpath,$LIBDIR"
-          make -j1 package/feeds/packages/python3/host/compile V=s LDFLAGS="-Wl,-rpath,$LIBDIR"
-          make -j"$THREADS" LDFLAGS="-Wl,-rpath,$LIBDIR" V=s 2>&1 | tee compile.log
-          if [ $? -ne 0 ]; then cat compile.log | tail -100; exit 1; fi
-          DEVICE=$(grep -m1 '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/')
-          [ -n "$DEVICE" ] && echo "DEVICE_NAME=_${DEVICE}" >> $GITHUB_ENV || echo "DEVICE_NAME=_unknown" >> $GITHUB_ENV
-          echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
-          kill -9 "${{ env.SPACE_MONITOR_PID }}" 2>/dev/null
+    - name: Upload bin directory
+      uses: actions/upload-artifact@main
+      if: steps.compile.outputs.status == 'success' && env.UPLOAD_BIN_DIR == 'true'
+      with:
+        name: OpenWrt_bin${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+        path: openwrt/bin
 
-      - name: 编译失败上传日志
-        uses: actions/upload-artifact@v4
-        if: failure() && !cancelled()
-        with:
-          name: compile-log-${{ env.FILE_DATE }}
-          path:
-            /workdir/openwrt/compile.log
-            /workdir/openwrt/download.log
-            /workdir/openwrt/feeds-update.log
+    # 整理编译好的固件
+    - name: Organize files
+      id: organize
+      if: env.UPLOAD_FIRMWARE == 'true' && !cancelled()
+      run: |
+        cd openwrt/bin/targets/*/*
+        rm -rf packages
+        rm -rf *.buildinfo
+        rm -rf *.manifest
+        rm -rf *.json
+        rm -rf *bl2.bin
+        echo "FIRMWARE=$PWD" >> $GITHUB_ENV
+        echo "status=success" >> $GITHUB_OUTPUT
 
-      - name: 整理固件文件（NAND校验）
-        id: organize
-        if: env.UPLOAD_FIRMWARE == 'true' && !cancelled()
-        run: |
-          FIRMWARE_DIR="/workdir/openwrt/bin/targets/mediatek/filogic"
-          cd "$FIRMWARE_DIR" || { echo "Error: 固件目录不存在！"; exit 1; }
-          rm -rf packages *.buildinfo *.manifest *.json *.md5sum *.sha256sum */debug
-          if ! find . -name "*mt7981*rootfs*nand*" -o -name "*mt7981*sysupgrade*"; then
-            echo "Error: NAND固件未生成！"; ls -la; exit 1;
-          fi
-          echo "FIRMWARE=$FIRMWARE_DIR" >> $GITHUB_ENV
-          echo "status=success" >> $GITHUB_OUTPUT
+    - name: Upload firmware directory
+      uses: actions/upload-artifact@main
+      if: steps.organize.outputs.status == 'success' && !cancelled()
+      with:
+        name: OpenWrt_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+        path: ${{ env.FIRMWARE }}
 
-      - name: 上传固件目录
-        uses: actions/upload-artifact@v4
-        if: steps.organize.outputs.status == 'success' && !cancelled()
-        with:
-          name: OpenWrt_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
-          path: ${{ env.FIRMWARE }}/*
-          retention-days: 3
+    - name: Upload firmware to cowtransfer
+      id: cowtransfer
+      if: steps.organize.outputs.status == 'success' && env.UPLOAD_COWTRANSFER == 'true' && !cancelled()
+      run: |
+        curl -fsSL git.io/file-transfer | sh
+        ./transfer cow --block 2621440 -s -p 64 --no-progress ${FIRMWARE} 2>&1 | tee cowtransfer.log
+        echo "::warning file=cowtransfer.com::$(cat cowtransfer.log | grep https)"
+        echo "url=$(cat cowtransfer.log | grep https | cut -f3 -d" ")" >> $GITHUB_OUTPUT
 
-      - name: 生成发布标签与说明
-        id: tag
-        if: env.UPLOAD_RELEASE == 'true' && !cancelled()
-        run: |
-          COMMIT_HASH=$(echo ${{ github.sha }} | cut -c1-8)
-          release_tag=$(date +"%Y.%m.%d-%H%M-immortalwrt24.10-6.6${{ env.DEVICE_NAME }}-$COMMIT_HASH")
-          CLEAN_DEVICE_NAME="${{ env.DEVICE_NAME }}"
-          CLEAN_DEVICE_NAME="${CLEAN_DEVICE_NAME#_}"
-          touch release.txt
-          echo "### ImmortalWrt 固件发布（${CLEAN_DEVICE_NAME}）" >> release.txt
-          echo "- 后台地址：http://192.168.6.1 或 http://immortalwrt.lan" >> release.txt
-          echo "- 登录账号：root" >> release.txt
-          echo "- 登录密码：无（首次登录需设置）" >> release.txt
-          echo "- 默认主题：Argon" >> release.txt
-          echo "- 集成插件：aria2、openlist2、diskman、lucky、ksmb、hd-idle、autoreboot、mtwifi-cfg" >> release.txt
-          echo "- 编译源码：${{ env.REPO_URL }}（分支：${{ env.REPO_BRANCH }}）" >> release.txt
-          echo "- 编译Commit：${{ github.sha }}（前8位：${COMMIT_HASH}）" >> release.txt
-          echo "- 编译时间：$(date +"%Y-%m-%d %H:%M:%S %Z")" >> release.txt
-          ls -1 "${FIRMWARE}"/* | xargs -n1 basename | sed 's/^/- /' >> release.txt
-          echo "release_tag=${release_tag}" >> $GITHUB_OUTPUT
+    - name: Upload firmware to WeTransfer
+      id: wetransfer
+      if: steps.organize.outputs.status == 'success' && env.UPLOAD_WETRANSFER == 'true' && !cancelled()
+      run: |
+        curl -fsSL git.io/file-transfer | sh
+        ./transfer wet -s -p 16 --no-progress ${FIRMWARE} 2>&1 | tee wetransfer.log
+        echo "::warning file=wetransfer.com::$(cat wetransfer.log | grep https)"
+        echo "url=$(cat wetransfer.log | grep https | cut -f3 -d" ")" >> $GITHUB_OUTPUT
 
-      - name: 上传固件到发布页
-        uses: softprops/action-gh-release@v1
-        if: steps.tag.outputs.status == 'success' && !cancelled()
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: ${{ steps.tag.outputs.release_tag }}
-          body_path: release.txt
-          files: ${{ env.FIRMWARE }}/*
-          draft: false
-          prerelease: false
-        timeout-minutes: 5
+    - name: Generate release tag
+      id: tag
+      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
+      run: |
+        echo "release_tag=$(date +"%Y.%m.%d-%H%M-immortalwrt24.10-6.6-cmcc_rax3000m-237")" >> $GITHUB_OUTPUT
+        touch release.txt
+        echo "cmcc_rax3000m-237大功率固件" >> release.txt
+        echo "后台：192.168.6.1" >> release.txt
+        echo "账号：root" >> release.txt
+        echo "密码：无" >> release.txt
+        echo "默认主题：Argon" >> release.txt
+        echo "集成插件：diskman ksmb hd-idle autoreboot mtwifi-cfg " >> release.txt
+        echo "编译源码：https://github.com/padavanonly/immortalwrt-mt798x-6.6" >> release.txt
+        echo "status=success" >> $GITHUB_OUTPUT
 
-      - name: 删除旧工作流记录（保留最近3条）
-        uses: GitRML/delete-workflow-runs@main
-        with:
-          retain_days: 1
-          keep_minimum_runs: 3
+    - name: Upload firmware to release
+      uses: softprops/action-gh-release@v1
+      if: steps.tag.outputs.status == 'success' && !cancelled()
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ steps.tag.outputs.release_tag }}
+        body_path: release.txt
+        files: ${{ env.FIRMWARE }}/*
+
+    - name: Delete workflow runs
+      uses: GitRML/delete-workflow-runs@main
+      with:
+        retain_days: 1
+        keep_minimum_runs: 3
